@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(node dist/index.js)",
+      "Bash(node -e \"let d='';process.stdin.on\\('data',c=>d+=c\\).on\\('end',\\(\\)=>{for\\(const l of d.split\\('\\\\n'\\)\\){if\\(!l.trim\\(\\)\\)continue;const j=JSON.parse\\(l\\);if\\(j.id===2\\)console.log\\('tools:',j.result.tools.map\\(t=>t.name\\).join\\(', '\\)\\)}}\\)\")"
+    ]
+  }
+}

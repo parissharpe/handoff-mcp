@@ -1,0 +1,27 @@
+{
+  "name": "handoff-mcp",
+  "version": "0.1.0",
+  "description": "MCP server providing cross-product handoff context for strategist and code workflows.",
+  "type": "module",
+  "bin": {
+    "handoff-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  }
+}

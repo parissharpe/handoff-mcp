@@ -3,5 +3,16 @@ dist/
 *.log
 .env
 .env.*
+!.env.example
 .DS_Store
 *.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local ChromaDB store (never commit the vector store)
+store/db/
+.handoff/

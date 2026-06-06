@@ -6,6 +6,8 @@ import {
   ListToolsRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { Store, startLocalServer, resolveStorePath } from "./store.js";
+import type { ChildProcess } from "node:child_process";
 
 /**
  * handoff-mcp
@@ -112,7 +114,7 @@ const TOOLS: Tool[] = [
 const server = new Server(
   {
     name: "handoff-mcp",
-    version: "0.1.0",
+    version: "0.2.0",
   },
   {
     capabilities: {
@@ -121,36 +123,258 @@ const server = new Server(
   }
 );
 
+// ---------------------------------------------------------------------------
+// Collections (must match the Python watchers and store.ts)
+// ---------------------------------------------------------------------------
+const COWORK_COLLECTION = "cowork_sessions";
+const CODE_COLLECTION = "code_sessions";
+const STRATEGIST_COLLECTION = "strategist_memory";
+
+// ---------------------------------------------------------------------------
+// Chroma lifecycle
+//
+// The chromadb JS client is server-based: it talks to a Chroma server over
+// HTTP. We lazily ensure a server is reachable on the first tool call — if one
+// is already listening (e.g. started separately, or by the watchers) we reuse
+// it; otherwise we spawn one backed by HANDOFF_STORE_PATH and own its lifecycle.
+// This keeps tools/list working without Chroma and defers the model load until
+// it's actually needed.
+// ---------------------------------------------------------------------------
+let storePromise: Promise<Store> | null = null;
+let ownedServer: ChildProcess | null = null;
+
+function chromaBaseUrl(): string {
+  const host = process.env.CHROMA_HOST ?? "localhost";
+  const port = process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : 8000;
+  return `http://${host}:${port}`;
+}
+
+async function isServerReachable(): Promise<boolean> {
+  try {
+    const res = await fetch(`${chromaBaseUrl()}/api/v2/heartbeat`);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Lazily resolve a connected Store, starting a local Chroma server if needed. */
+function getStore(): Promise<Store> {
+  if (!storePromise) {
+    storePromise = (async () => {
+      if (!(await isServerReachable())) {
+        const storePath = resolveStorePath();
+        console.error(`handoff-mcp: starting local Chroma server (${storePath})`);
+        const handle = await startLocalServer({ storePath });
+        ownedServer = handle.proc;
+      } else {
+        console.error("handoff-mcp: reusing existing Chroma server");
+      }
+      return new Store();
+    })();
+    // If startup fails, allow a later retry instead of caching the rejection.
+    storePromise.catch(() => {
+      storePromise = null;
+    });
+  }
+  return storePromise;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function asText(payload: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+  };
+}
+
+function num(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/** Split the comma-joined `tags` string back into an array for output. */
+function decodeTags(meta: Record<string, unknown> | null): string[] {
+  const raw = meta?.tags;
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  return raw.split(",");
+}
+
+// ---------------------------------------------------------------------------
+// Request handlers
+// ---------------------------------------------------------------------------
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
+  const args = (rawArgs ?? {}) as Record<string, unknown>;
 
   if (!TOOLS.some((tool) => tool.name === name)) {
     throw new Error(`Unknown tool: ${name}`);
   }
 
-  // Stub implementation: echo the call so the wiring can be verified.
-  return {
-    content: [
-      {
-        type: "text",
-        text: `[stub] ${name} called with: ${JSON.stringify(args ?? {})}`,
-      },
-    ],
-  };
+  try {
+    const store = await getStore();
+
+    switch (name) {
+      case "get_recent_cowork_context": {
+        const limit = num(args.limit, 5);
+        const since =
+          typeof args.since === "string" ? args.since : undefined;
+        let items = await store.listRecent(COWORK_COLLECTION, limit + 25);
+        if (since) {
+          items = items.filter(
+            (r) => String(r.metadata?.created_at ?? "") >= since,
+          );
+        }
+        items = items.slice(0, limit);
+        return asText({
+          collection: COWORK_COLLECTION,
+          count: items.length,
+          items: items.map((r) => ({
+            id: r.id,
+            content: r.document,
+            metadata: r.metadata,
+          })),
+        });
+      }
+
+      case "get_recent_code_context": {
+        const limit = num(args.limit, 5);
+        const repo = typeof args.repo === "string" ? args.repo : undefined;
+        let items = await store.listRecent(CODE_COLLECTION, limit + 25);
+        if (repo) {
+          items = items.filter((r) => {
+            const m = r.metadata ?? {};
+            return m.repo === repo || m.path === repo || m.project === repo;
+          });
+        }
+        items = items.slice(0, limit);
+        return asText({
+          collection: CODE_COLLECTION,
+          repo: repo ?? null,
+          count: items.length,
+          items: items.map((r) => ({
+            id: r.id,
+            content: r.document,
+            metadata: r.metadata,
+          })),
+        });
+      }
+
+      case "query_strategist_memory": {
+        const query = typeof args.query === "string" ? args.query : "";
+        if (!query) throw new Error("`query` is required");
+        const limit = num(args.limit, 5);
+        const results = await store.query(STRATEGIST_COLLECTION, query, limit);
+        return asText({
+          collection: STRATEGIST_COLLECTION,
+          query,
+          count: results.length,
+          results: results.map((r) => ({
+            id: r.id,
+            content: r.document,
+            tags: decodeTags(r.metadata),
+            distance: r.distance ?? null,
+            metadata: r.metadata,
+          })),
+        });
+      }
+
+      case "write_strategist_finding": {
+        const finding =
+          typeof args.finding === "string" ? args.finding : "";
+        if (!finding) throw new Error("`finding` is required");
+        const tags = Array.isArray(args.tags)
+          ? args.tags.map((t) => String(t))
+          : [];
+        const id = await store.write(STRATEGIST_COLLECTION, finding, tags);
+        return asText({
+          status: "written",
+          id,
+          collection: STRATEGIST_COLLECTION,
+          tags,
+        });
+      }
+
+      case "get_cross_product_brief": {
+        const topic = typeof args.topic === "string" ? args.topic : "";
+        if (!topic) throw new Error("`topic` is required");
+        const perSource = num(args.limit, 3);
+        const [cowork, code, memory] = await Promise.all([
+          store.query(COWORK_COLLECTION, topic, perSource).catch(() => []),
+          store.query(CODE_COLLECTION, topic, perSource).catch(() => []),
+          store
+            .query(STRATEGIST_COLLECTION, topic, perSource)
+            .catch(() => []),
+        ]);
+        const shape = (r: {
+          id: string;
+          document: string | null;
+          metadata: Record<string, unknown> | null;
+          distance?: number | null;
+        }) => ({ id: r.id, content: r.document, distance: r.distance ?? null });
+        return asText({
+          topic,
+          sources: {
+            cowork_sessions: cowork.map(shape),
+            code_sessions: code.map(shape),
+            strategist_memory: memory.map(shape),
+          },
+          totals: {
+            cowork: cowork.length,
+            code: code.length,
+            memory: memory.length,
+          },
+        });
+      }
+
+      default:
+        throw new Error(`Unhandled tool: ${name}`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ error: message, tool: name }, null, 2),
+        },
+      ],
+    };
+  }
 });
+
+function shutdown() {
+  if (ownedServer) {
+    ownedServer.kill();
+    ownedServer = null;
+  }
+}
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Use stderr so we don't corrupt the stdio JSON-RPC stream.
-  console.error("handoff-mcp server running on stdio");
+  console.error("handoff-mcp v0.2.0 server running on stdio");
 }
+
+process.on("SIGINT", () => {
+  shutdown();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  shutdown();
+  process.exit(0);
+});
+process.on("exit", shutdown);
 
 main().catch((error) => {
   console.error("Fatal error starting handoff-mcp:", error);
+  shutdown();
   process.exit(1);
 });

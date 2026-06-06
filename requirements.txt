@@ -1,0 +1,5 @@
+# Python dependencies for handoff-mcp file watchers (watchers/cowork.py).
+# Windows-first; pinned with >= floors to reasonably current versions.
+
+watchdog>=4.0.0
+chromadb>=0.5.0

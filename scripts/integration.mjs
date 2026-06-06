@@ -1,5 +1,5 @@
 /**
- * Coexistence integration test for handoff-mcp v0.2.0.
+ * Coexistence integration test for handoff-mcp v0.3.0.
  *
  * Proves the reconciled architecture: the Node MCP server owns ONE Chroma
  * server, and the Python cowork watcher writes into that SAME server over HTTP

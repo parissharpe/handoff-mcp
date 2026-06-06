@@ -113,7 +113,7 @@ const TOOLS: Tool[] = [
 const server = new Server(
   {
     name: "handoff-mcp",
-    version: "0.2.0",
+    version: "0.3.0",
   },
   {
     capabilities: {
@@ -370,7 +370,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Use stderr so we don't corrupt the stdio JSON-RPC stream.
-  console.error("handoff-mcp v0.2.0 server running on stdio");
+  console.error("handoff-mcp v0.3.0 server running on stdio");
 }
 
 process.on("SIGINT", () => void shutdown(0));

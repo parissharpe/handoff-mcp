@@ -1,5 +1,5 @@
 /**
- * End-to-end smoke test for handoff-mcp v0.2.0.
+ * End-to-end smoke test for handoff-mcp v0.3.0.
  *
  * Launches the compiled MCP server over stdio against a TEMP store + dedicated
  * Chroma port, then drives all five tools and asserts each returns a real data
@@ -101,7 +101,7 @@ async function main() {
     capabilities: {},
     clientInfo: { name: "smoke", version: "0" },
   });
-  check(init.result?.serverInfo?.version === "0.2.0", "server reports v0.2.0");
+  check(init.result?.serverInfo?.version === "0.3.0", "server reports v0.3.0");
   notify("notifications/initialized", {});
 
   // 2) tools/list shows all five

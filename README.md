@@ -1,5 +1,9 @@
 # Handoff
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Node](https://img.shields.io/badge/node-%E2%89%A520-339933?logo=node.js&logoColor=white)
+![Python](https://img.shields.io/badge/python-%E2%89%A53.11-3776AB?logo=python&logoColor=white)
+
 **A local-first MCP server that gives any Claude instance (Claude.ai, Code, Cowork) a shared working memory it can read from and write to, so you stop re-explaining your context every time you switch tools.**
 
 *Handoff* is an aviation term for passing communication between controllers as an aircraft moves through airspace. That's exactly what this does: it passes your strategic context between the specialized Claude products you already run in parallel.
@@ -69,7 +73,7 @@ There is no separate "strategist model." The strategist is any Claude instance w
 npm install -g handoff-mcp
 ```
 
-Then add a block to your `claude_desktop_config.json`:
+Then add a block to your `claude_desktop_config.json` (a ready-to-edit copy lives in [`mcp.json.example`](mcp.json.example)):
 
 ```json
 {
@@ -87,6 +91,27 @@ Then add a block to your `claude_desktop_config.json`:
 }
 ```
 
+### Run the watchers
+
+The MCP server reads and writes the store; the **watchers** feed it. Run them as
+background processes (they discover the running server via `server.json`, so no
+extra config is needed):
+
+```bash
+python watchers/cowork.py    # indexes COWORK_OUTPUT_FOLDER -> cowork_sessions
+python watchers/code.py      # indexes CODE_PROJECT_PATH    -> code_sessions
+```
+
+### See it work
+
+```bash
+npm run build && npm run demo
+```
+
+The demo seeds three mock Cowork outputs and three mock Code outputs, then calls
+the real tools — ending with `get_cross_product_brief` surfacing both products'
+context for one topic.
+
 ### Prerequisites
 
 - Node.js v20+
@@ -103,7 +128,7 @@ The entire configuration surface is a handful of environment variables.
 | Variable | Required | Description |
 |---|---|---|
 | `COWORK_OUTPUT_FOLDER` | Yes | Path to Cowork's output folder. The Cowork watcher monitors this directory and indexes new/modified files into `cowork_sessions`. |
-| `CODE_PROJECT_PATH` | Yes | Root of the Claude Code project to monitor (CLAUDE.md + transcripts). Consumed by the Code watcher (see status below). |
+| `CODE_PROJECT_PATH` | Yes | Root of the Claude Code project to monitor. The Code watcher indexes its curated context (CLAUDE.md / CLAUDE.local.md, `transcripts/` & `.claude/` dirs, `*.jsonl`) into `code_sessions`. |
 | `HANDOFF_STORE_PATH` | No | Where the local ChromaDB store lives. Defaults to `~/.handoff/db`. |
 | `CHROMA_HOST` | No | Host of the Chroma server the components talk to. Defaults to `localhost`. |
 | `CHROMA_PORT` | No | Port of the Chroma server. Defaults to `8000`. |
@@ -124,16 +149,15 @@ Point `CHROMA_HOST` / `CHROMA_PORT` at it if you use a non-default endpoint.
 
 ## Status
 
-**v0.2.0** — current release:
+**v0.3.0** — current release:
 
 - ✅ MCP server with all five tools wired to a real ChromaDB store
 - ✅ Local vector store with `cowork_sessions`, `code_sessions`, and `strategist_memory` collections
-- ✅ Cowork watcher (Windows-first), writing into the shared store over HTTP
+- ✅ Cowork watcher **and** Code watcher (Windows-first), both writing into the shared store over HTTP
+- ✅ Single shared Chroma server coordinated via a `server.json` endpoint file, with graceful shutdown and a startup readiness gate (no empty-read races on restart)
 - ✅ Local embeddings, no API key required
 
-**Deferred to v0.3.0:**
-
-- ⏳ Code watcher (`watchers/code.py`) — monitoring CLAUDE.md and Code transcripts. The `code_sessions` collection is wired and readable today; it just isn't fed by a watcher yet.
+**Ideas for later (build only if the community asks):** Obsidian export, multi-project support, custom embedding-model selection, a web UI for browsing the local store.
 
 ---
 

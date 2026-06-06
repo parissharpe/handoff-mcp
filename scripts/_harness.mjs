@@ -15,26 +15,46 @@ import { fileURLToPath } from "node:url";
 
 export const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-/** Locate a Python interpreter in a CI-portable way. */
+/**
+ * Locate a Python interpreter that actually has the watcher dependencies
+ * (chromadb + watchdog). PATH may expose several Pythons (incl. the Windows
+ * Store stub) without the deps, so we verify importability rather than just
+ * taking the first `python` we find. Order: HANDOFF_PYTHON, PATH candidates,
+ * the per-user dev install. Throws a clear error if none qualify.
+ */
 export function findPython() {
-  if (process.env.HANDOFF_PYTHON) return process.env.HANDOFF_PYTHON;
-  const candidates =
-    process.platform === "win32" ? ["python.exe", "python3.exe", "py.exe"] : ["python3", "python"];
-  for (const c of candidates) {
-    const r = spawnSync(c, ["--version"], { stdio: "ignore" });
-    if (r.status === 0) return c;
-  }
-  // Last resort: the per-user install location used during development.
-  const fallback = path.join(
-    process.env.LOCALAPPDATA || "",
-    "Programs",
-    "Python",
-    "Python312",
-    "python.exe",
+  const canImport = (exe) => {
+    const v = spawnSync(exe, ["--version"], { stdio: "ignore" });
+    if (v.status !== 0) return false;
+    const r = spawnSync(exe, ["-c", "import chromadb, watchdog"], { stdio: "ignore" });
+    return r.status === 0;
+  };
+
+  const candidates = [];
+  if (process.env.HANDOFF_PYTHON) candidates.push(process.env.HANDOFF_PYTHON);
+  candidates.push(
+    ...(process.platform === "win32"
+      ? ["python.exe", "python3.exe", "py.exe"]
+      : ["python3", "python"]),
   );
-  if (process.platform === "win32" && fs.existsSync(fallback)) return fallback;
+  if (process.platform === "win32") {
+    candidates.push(
+      path.join(
+        process.env.LOCALAPPDATA || "",
+        "Programs",
+        "Python",
+        "Python312",
+        "python.exe",
+      ),
+    );
+  }
+
+  for (const c of candidates) {
+    if (c && canImport(c)) return c;
+  }
   throw new Error(
-    "No Python interpreter found. Set HANDOFF_PYTHON or add python to PATH.",
+    "No Python with chromadb + watchdog found. Install deps " +
+      "(pip install -r requirements.txt) or set HANDOFF_PYTHON to a Python that has them.",
   );
 }
 

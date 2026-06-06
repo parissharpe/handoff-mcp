@@ -1,0 +1,14 @@
+{
+  "//": "handoff-mcp — paste this block into your claude_desktop_config.json (under mcpServers) and adjust the paths. The MCP server auto-starts a local Chroma server; run the Python watchers separately to feed it.",
+  "mcpServers": {
+    "handoff": {
+      "command": "npx",
+      "args": ["handoff-mcp"],
+      "env": {
+        "COWORK_OUTPUT_FOLDER": "C:\\Users\\you\\Documents\\Cowork",
+        "CODE_PROJECT_PATH": "C:\\Users\\you\\projects\\my-project",
+        "HANDOFF_STORE_PATH": "C:\\Users\\you\\.handoff\\db"
+      }
+    }
+  }
+}

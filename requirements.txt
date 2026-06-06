@@ -1,5 +1,10 @@
-# Python dependencies for handoff-mcp file watchers (watchers/cowork.py).
-# Windows-first; pinned with >= floors to reasonably current versions.
+# Python dependencies for the handoff-mcp file watchers
+# (watchers/cowork.py, watchers/code.py, watchers/_indexer.py).
+# Windows-first; pinned with >= floors to the versions these were built against.
 
+# File-system watching.
 watchdog>=4.0.0
-chromadb>=0.5.0
+
+# Vector store client. 1.x is required: the watchers connect to the Chroma
+# SERVER over HTTP (chromadb.HttpClient + the v2 API), which the MCP server runs.
+chromadb>=1.0.0

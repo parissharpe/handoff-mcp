@@ -157,12 +157,45 @@ def get_store_path() -> Path:
     return path
 
 
-def get_chroma_endpoint() -> tuple[str, int]:
-    """Resolve the Chroma server endpoint from CHROMA_HOST / CHROMA_PORT."""
-    host = os.environ.get("CHROMA_HOST", DEFAULT_CHROMA_HOST)
+def read_endpoint_file() -> Optional[dict]:
+    """Read <HANDOFF_STORE_PATH>/server.json written by the MCP server, if any."""
+    import json
+
+    f = get_store_path() / "server.json"
     try:
-        port = int(os.environ.get("CHROMA_PORT", str(DEFAULT_CHROMA_PORT)))
-    except ValueError:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "port" in data:
+            return {
+                "host": str(data.get("host", DEFAULT_CHROMA_HOST)),
+                "port": int(data["port"]),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def get_chroma_endpoint() -> tuple[str, int]:
+    """Resolve the Chroma server endpoint.
+
+    Priority (per field): explicit CHROMA_HOST / CHROMA_PORT env vars, then the
+    server.json endpoint file written by the MCP server, then defaults. This lets
+    the watcher and the MCP server share ONE server even when the port was chosen
+    dynamically.
+    """
+    env_host = os.environ.get("CHROMA_HOST")
+    env_port = os.environ.get("CHROMA_PORT")
+
+    ep = read_endpoint_file() if (not env_host or not env_port) else None
+
+    host = env_host or (ep["host"] if ep else DEFAULT_CHROMA_HOST)
+    if env_port:
+        try:
+            port = int(env_port)
+        except ValueError:
+            port = DEFAULT_CHROMA_PORT
+    elif ep:
+        port = ep["port"]
+    else:
         port = DEFAULT_CHROMA_PORT
     return host, port
 

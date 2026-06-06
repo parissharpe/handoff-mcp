@@ -6,8 +6,7 @@ import {
   ListToolsRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Store, startLocalServer, resolveStorePath } from "./store.js";
-import type { ChildProcess } from "node:child_process";
+import { Store, ensureServer } from "./store.js";
 
 /**
  * handoff-mcp
@@ -134,43 +133,31 @@ const STRATEGIST_COLLECTION = "strategist_memory";
 // Chroma lifecycle
 //
 // The chromadb JS client is server-based: it talks to a Chroma server over
-// HTTP. We lazily ensure a server is reachable on the first tool call — if one
-// is already listening (e.g. started separately, or by the watchers) we reuse
-// it; otherwise we spawn one backed by HANDOFF_STORE_PATH and own its lifecycle.
-// This keeps tools/list working without Chroma and defers the model load until
-// it's actually needed.
+// HTTP. We lazily ensure a server is reachable on the first tool call via
+// ensureServer(), which connects to an already-running shared server (found via
+// CHROMA_HOST/PORT or the server.json endpoint file) or starts one backed by
+// HANDOFF_STORE_PATH and owns its lifecycle. This keeps tools/list working
+// without Chroma and defers the model load until it's actually needed.
 // ---------------------------------------------------------------------------
 let storePromise: Promise<Store> | null = null;
-let ownedServer: ChildProcess | null = null;
+let stopOwnedServer: (() => Promise<void>) | null = null;
 
-function chromaBaseUrl(): string {
-  const host = process.env.CHROMA_HOST ?? "localhost";
-  const port = process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : 8000;
-  return `http://${host}:${port}`;
-}
-
-async function isServerReachable(): Promise<boolean> {
-  try {
-    const res = await fetch(`${chromaBaseUrl()}/api/v2/heartbeat`);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-/** Lazily resolve a connected Store, starting a local Chroma server if needed. */
+/** Lazily resolve a connected Store, starting a shared Chroma server if needed. */
 function getStore(): Promise<Store> {
   if (!storePromise) {
     storePromise = (async () => {
-      if (!(await isServerReachable())) {
-        const storePath = resolveStorePath();
-        console.error(`handoff-mcp: starting local Chroma server (${storePath})`);
-        const handle = await startLocalServer({ storePath });
-        ownedServer = handle.proc;
+      const { endpoint, started, stop } = await ensureServer();
+      if (started) {
+        stopOwnedServer = stop;
+        console.error(
+          `handoff-mcp: started shared Chroma server at ${endpoint.host}:${endpoint.port}`,
+        );
       } else {
-        console.error("handoff-mcp: reusing existing Chroma server");
+        console.error(
+          `handoff-mcp: connected to Chroma server at ${endpoint.host}:${endpoint.port}`,
+        );
       }
-      return new Store();
+      return new Store({ host: endpoint.host, port: endpoint.port });
     })();
     // If startup fails, allow a later retry instead of caching the rejection.
     storePromise.catch(() => {
@@ -349,11 +336,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-function shutdown() {
-  if (ownedServer) {
-    ownedServer.kill();
-    ownedServer = null;
+let shuttingDown = false;
+async function shutdown(code: number): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const stop = stopOwnedServer;
+  stopOwnedServer = null;
+  if (stop) {
+    try {
+      await stop(); // graceful-first: flush + release the port before exit
+    } catch {
+      // best-effort
+    }
   }
+  process.exit(code);
 }
 
 async function main() {
@@ -363,18 +359,15 @@ async function main() {
   console.error("handoff-mcp v0.2.0 server running on stdio");
 }
 
-process.on("SIGINT", () => {
-  shutdown();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  shutdown();
-  process.exit(0);
-});
-process.on("exit", shutdown);
+process.on("SIGINT", () => void shutdown(0));
+process.on("SIGTERM", () => void shutdown(0));
+// MCP hosts (especially on Windows) typically stop a stdio server by closing
+// its stdin rather than sending a signal. Treat transport close / stdin EOF as
+// a shutdown trigger so we still stop the Chroma server gracefully.
+server.onclose = () => void shutdown(0);
+process.stdin.on("close", () => void shutdown(0));
 
 main().catch((error) => {
   console.error("Fatal error starting handoff-mcp:", error);
-  shutdown();
-  process.exit(1);
+  void shutdown(1);
 });

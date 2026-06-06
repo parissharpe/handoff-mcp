@@ -19,3 +19,7 @@ venv/
 # Local ChromaDB store (never commit the vector store)
 store/db/
 .handoff/
+
+# Guard against stray in-repo Chroma stores (e.g. from a mangled store path)
+**/chroma.sqlite3
+Usersparis*/

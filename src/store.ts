@@ -25,10 +25,22 @@
  * Node process. No OpenAI/Anthropic key is required. That package is installed
  * as a dependency.
  *
- * RUNTIME PREREQUISITE: a reachable Chroma server. By default this adapter
- * connects to http://localhost:8000 (override with CHROMA_HOST / CHROMA_PORT).
- * Callers/tests can use `startLocalServer()` to spawn one backed by
- * HANDOFF_STORE_PATH, or run `chroma run --path <HANDOFF_STORE_PATH>` separately.
+ * RUNTIME PREREQUISITE: a reachable Chroma server. Use `ensureServer()` to get
+ * one with no fuss — it connects to an already-running server if it can find one
+ * and otherwise starts a single shared server backed by HANDOFF_STORE_PATH.
+ *
+ * SERVER COORDINATION (server.json): so the MCP server and the Python watchers
+ * all talk to ONE server (rather than each starting their own and colliding on a
+ * port), the process that starts a server writes a small endpoint file at
+ * <HANDOFF_STORE_PATH>/server.json: { host, port, pid, startedAt }. Other
+ * processes read it to discover where to connect. The file is advisory — every
+ * consumer heartbeat-checks the endpoint before trusting it, so a stale file
+ * left by a crash is harmless (the next start overwrites it). Explicit
+ * CHROMA_HOST / CHROMA_PORT env vars always win over the file.
+ *
+ * SHUTDOWN: stopping a server we started is graceful-first (request close, wait
+ * for the port to be released) and force-kills only as a fallback, so the next
+ * start doesn't race a half-dead predecessor.
  *
  * METADATA CONTRACT (shared with the Python watcher):
  *   - Every document's metadata carries `created_at`: an ISO-8601 string.
@@ -42,7 +54,8 @@
 import { ChromaClient, type Metadata } from "chromadb";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -83,6 +96,127 @@ export function resolveStorePath(): string {
   return resolved;
 }
 
+/** Describes where a Chroma server is reachable. */
+export interface Endpoint {
+  host: string;
+  port: number;
+  pid?: number;
+  startedAt?: string;
+}
+
+const DEFAULT_PORT = 8000;
+
+/** Path to the advisory endpoint file inside the store directory. */
+export function endpointFilePath(storePath = resolveStorePath()): string {
+  return path.join(storePath, "server.json");
+}
+
+/** Read the endpoint file, or null if missing/unparseable. */
+export function readEndpoint(storePath = resolveStorePath()): Endpoint | null {
+  try {
+    const raw = fs.readFileSync(endpointFilePath(storePath), "utf8");
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj.port === "number") {
+      return {
+        host: typeof obj.host === "string" ? obj.host : "localhost",
+        port: obj.port,
+        pid: typeof obj.pid === "number" ? obj.pid : undefined,
+        startedAt: typeof obj.startedAt === "string" ? obj.startedAt : undefined,
+      };
+    }
+  } catch {
+    // missing or malformed -> treat as absent
+  }
+  return null;
+}
+
+function writeEndpoint(storePath: string, ep: Endpoint): void {
+  try {
+    fs.writeFileSync(endpointFilePath(storePath), JSON.stringify(ep, null, 2));
+  } catch {
+    // best-effort; coordination still works via heartbeat probing
+  }
+}
+
+function removeEndpoint(storePath: string): void {
+  try {
+    fs.rmSync(endpointFilePath(storePath), { force: true });
+  } catch {
+    // ignore
+  }
+}
+
+/** True if a Chroma server answers its heartbeat at host:port. */
+export async function heartbeatOk(
+  host: string,
+  port: number,
+  timeoutMs = 1500,
+): Promise<boolean> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const r = await fetch(`http://${host}:${port}/api/v2/heartbeat`, {
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** True if nothing is currently listening on the TCP port (i.e. it's free). */
+function isPortFree(port: number, host = "127.0.0.1"): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once("error", () => resolve(false));
+    srv.once("listening", () => srv.close(() => resolve(true)));
+    srv.listen(port, host);
+  });
+}
+
+/** Ask the OS for an available ephemeral port. */
+function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, () => {
+      const addr = srv.address();
+      if (addr && typeof addr === "object") {
+        const port = addr.port;
+        srv.close(() => resolve(port));
+      } else {
+        srv.close(() => reject(new Error("could not determine a free port")));
+      }
+    });
+  });
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Errors that indicate the server is up but not yet ready / momentarily flaky. */
+function isTransient(err: unknown): boolean {
+  const msg = String((err as { message?: string })?.message ?? err);
+  return /ChromaConnection|Failed to connect|fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|503|502/i.test(
+    msg,
+  );
+}
+
+/** Retry `fn` on transient connection errors with linear backoff. */
+async function retry<T>(fn: () => Promise<T>, attempts = 6, baseMs = 300): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransient(err)) throw err;
+      await sleep(baseMs * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
 function serializeTags(tags: string[]): string {
   return tags.join(",");
 }
@@ -115,11 +249,14 @@ export class Store {
     this.client = new ChromaClient({ host, port, ssl });
   }
 
-  /** Lazily get-or-create a collection by name (cached per instance). */
+  /** Lazily get-or-create a collection by name (cached per instance).
+   *  Rejected promises are NOT cached, so a transient failure (e.g. the server
+   *  not yet ready) doesn't poison the cache for the lifetime of the Store. */
   private getCollection(name: string) {
     let existing = this.collections.get(name);
     if (!existing) {
       existing = this.client.getOrCreateCollection({ name });
+      existing.catch(() => this.collections.delete(name));
       this.collections.set(name, existing);
     }
     return existing;
@@ -140,9 +277,11 @@ export class Store {
       created_at:
         (metadata.created_at as string | undefined) ?? new Date().toISOString(),
     };
-    const col = await this.getCollection(collection);
-    await col.add({ ids: [id], documents: [content], metadatas: [meta] });
-    return id;
+    return retry(async () => {
+      const col = await this.getCollection(collection);
+      await col.add({ ids: [id], documents: [content], metadatas: [meta] });
+      return id;
+    });
   }
 
   /**
@@ -154,18 +293,20 @@ export class Store {
     queryText: string,
     n: number,
   ): Promise<StoreRecord[]> {
-    const col = await this.getCollection(collection);
-    const res = await col.query({ queryTexts: [queryText], nResults: n });
-    const ids = res.ids[0] ?? [];
-    const documents = res.documents[0] ?? [];
-    const metadatas = res.metadatas[0] ?? [];
-    const distances = res.distances[0] ?? [];
-    return ids.map((id, i) => ({
-      id,
-      document: documents[i] ?? null,
-      metadata: normalizeMetadata(metadatas[i]),
-      distance: distances[i] ?? null,
-    }));
+    return retry(async () => {
+      const col = await this.getCollection(collection);
+      const res = await col.query({ queryTexts: [queryText], nResults: n });
+      const ids = res.ids[0] ?? [];
+      const documents = res.documents[0] ?? [];
+      const metadatas = res.metadatas[0] ?? [];
+      const distances = res.distances[0] ?? [];
+      return ids.map((id, i) => ({
+        id,
+        document: documents[i] ?? null,
+        metadata: normalizeMetadata(metadatas[i]),
+        distance: distances[i] ?? null,
+      }));
+    });
   }
 
   /**
@@ -174,19 +315,21 @@ export class Store {
    * sorts client-side (Chroma has no native order-by on metadata).
    */
   async listRecent(collection: string, n: number): Promise<StoreRecord[]> {
-    const col = await this.getCollection(collection);
-    const res = await col.get({ include: ["documents", "metadatas"] as never });
-    const records: StoreRecord[] = res.ids.map((id, i) => ({
-      id,
-      document: res.documents[i] ?? null,
-      metadata: normalizeMetadata(res.metadatas[i]),
-    }));
-    records.sort((a, b) => {
-      const aT = String(a.metadata?.created_at ?? "");
-      const bT = String(b.metadata?.created_at ?? "");
-      return bT.localeCompare(aT);
+    return retry(async () => {
+      const col = await this.getCollection(collection);
+      const res = await col.get({ include: ["documents", "metadatas"] as never });
+      const records: StoreRecord[] = res.ids.map((id, i) => ({
+        id,
+        document: res.documents[i] ?? null,
+        metadata: normalizeMetadata(res.metadatas[i]),
+      }));
+      records.sort((a, b) => {
+        const aT = String(a.metadata?.created_at ?? "");
+        const bT = String(b.metadata?.created_at ?? "");
+        return bT.localeCompare(aT);
+      });
+      return records.slice(0, n);
     });
-    return records.slice(0, n);
   }
 
   /**
@@ -207,26 +350,79 @@ export class Store {
   }
 }
 
+/** Stop a server process by pid: graceful-first, force fallback, then wait for
+ *  the port to actually free so a subsequent start can't race a half-dead one. */
+async function stopServer(
+  proc: ChildProcess,
+  port: number,
+  storePath: string,
+): Promise<void> {
+  removeEndpoint(storePath);
+  const pid = proc.pid;
+  if (pid === undefined) return;
+
+  const waitForPortFree = async (ms: number): Promise<boolean> => {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      if (await isPortFree(port)) return true;
+      await sleep(150);
+    }
+    return false;
+  };
+
+  // 1) Graceful request.
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(pid), "/T"], { stdio: "ignore" });
+  } else {
+    try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+  }
+  if (await waitForPortFree(5000)) return;
+
+  // 2) Force fallback.
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+  } else {
+    try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+  }
+  await waitForPortFree(3000);
+}
+
 /**
  * Spawn a local Chroma server backed by HANDOFF_STORE_PATH.
  *
  * On Windows x64 the bundled `chroma` CLI is broken (arch guard rejects x64),
  * so we load the native binding directly in a tiny child process. On other
- * platforms we shell out to the `chroma` binary. Returns the child process and
- * a `ready` promise that resolves once the server answers its heartbeat.
+ * platforms we shell out to the `chroma` binary.
+ *
+ * Port selection: explicit opts.port > CHROMA_PORT env > 8000 (if free) > a
+ * free ephemeral port. After the server answers its heartbeat we also wait for
+ * the API to be READY (listCollections succeeds) so callers never read against a
+ * half-initialized server, then write the advisory server.json endpoint file.
+ * The returned `stop` is graceful-first.
  */
 export async function startLocalServer(opts?: {
   storePath?: string;
   host?: string;
   port?: number;
   timeoutMs?: number;
-}): Promise<{ proc: ChildProcess; host: string; port: number; stop: () => void }> {
+}): Promise<{
+  proc: ChildProcess;
+  host: string;
+  port: number;
+  stop: () => Promise<void>;
+}> {
   const storePath = opts?.storePath ?? resolveStorePath();
   const host = opts?.host ?? process.env.CHROMA_HOST ?? "localhost";
-  const port =
-    opts?.port ??
-    (process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : 8000);
   const timeoutMs = opts?.timeoutMs ?? 30_000;
+
+  let port: number;
+  if (opts?.port !== undefined) {
+    port = opts.port;
+  } else if (process.env.CHROMA_PORT) {
+    port = Number(process.env.CHROMA_PORT);
+  } else {
+    port = (await isPortFree(DEFAULT_PORT)) ? DEFAULT_PORT : await getFreePort();
+  }
 
   let proc: ChildProcess;
   if (process.platform === "win32" && process.arch === "x64") {
@@ -259,25 +455,90 @@ export async function startLocalServer(opts?: {
     );
   }
 
-  const base = `http://${host}:${port}`;
   const deadline = Date.now() + timeoutMs;
   // Poll heartbeat until the server is up.
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    try {
-      const r = await fetch(`${base}/api/v2/heartbeat`);
-      if (r.ok) break;
-    } catch {
-      // not up yet
-    }
+  while (!(await heartbeatOk(host, port))) {
     if (Date.now() > deadline) {
-      proc.kill();
+      await stopServer(proc, port, storePath);
       throw new Error(
-        `Chroma server did not become ready on ${base} within ${timeoutMs}ms`,
+        `Chroma server did not become ready on http://${host}:${port} within ${timeoutMs}ms`,
       );
     }
-    await new Promise((res) => setTimeout(res, 250));
+    await sleep(250);
   }
 
-  return { proc, host, port, stop: () => proc.kill() };
+  // Readiness gate: heartbeat can answer before the API/tenant is fully serving.
+  // Confirm a real API call succeeds before declaring the server usable.
+  const probe = new ChromaClient({ host, port, ssl: false });
+  try {
+    await retry(() => probe.listCollections(), 12, 250);
+  } catch (err) {
+    await stopServer(proc, port, storePath);
+    throw new Error(
+      `Chroma server on http://${host}:${port} never became ready: ${String(
+        (err as { message?: string })?.message ?? err,
+      )}`,
+    );
+  }
+
+  writeEndpoint(storePath, {
+    host,
+    port,
+    pid: proc.pid,
+    startedAt: new Date().toISOString(),
+  });
+
+  return {
+    proc,
+    host,
+    port,
+    stop: () => stopServer(proc, port, storePath),
+  };
+}
+
+/**
+ * Get a usable Chroma endpoint with minimal fuss.
+ *
+ * Resolution order:
+ *   1. An explicit CHROMA_HOST/CHROMA_PORT endpoint, if it answers a heartbeat.
+ *   2. The server.json endpoint file, if it answers a heartbeat.
+ *   3. Otherwise start a new shared server (which writes server.json).
+ *
+ * Returns the endpoint, whether we started it, and a `stop` that is a no-op when
+ * we connected to a server someone else owns (so callers can always call stop).
+ */
+export async function ensureServer(opts?: { storePath?: string }): Promise<{
+  endpoint: Endpoint;
+  started: boolean;
+  stop: () => Promise<void>;
+}> {
+  const storePath = opts?.storePath ?? resolveStorePath();
+  const envHost = process.env.CHROMA_HOST;
+  const envPort = process.env.CHROMA_PORT
+    ? Number(process.env.CHROMA_PORT)
+    : undefined;
+
+  const candidates: Endpoint[] = [];
+  if (envHost || envPort) {
+    candidates.push({ host: envHost ?? "localhost", port: envPort ?? DEFAULT_PORT });
+  }
+  const fileEp = readEndpoint(storePath);
+  if (fileEp) candidates.push(fileEp);
+
+  for (const ep of candidates) {
+    if (await heartbeatOk(ep.host, ep.port)) {
+      return { endpoint: ep, started: false, stop: async () => {} };
+    }
+  }
+
+  const handle = await startLocalServer({
+    storePath,
+    host: envHost ?? "localhost",
+    port: envPort, // undefined => startLocalServer picks 8000-or-free
+  });
+  return {
+    endpoint: { host: handle.host, port: handle.port },
+    started: true,
+    stop: handle.stop,
+  };
 }

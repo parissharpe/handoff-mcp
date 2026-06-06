@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { gracefulStop, rmRetry } from "./_harness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -190,9 +191,9 @@ async function main() {
 }
 
 main()
-  .then(() => {
-    proc.kill();
-    try { fs.rmSync(storePath, { recursive: true, force: true }); } catch {}
+  .then(async () => {
+    await gracefulStop(proc);
+    rmRetry(storePath);
     if (failures.length) {
       console.error(`\n${failures.length} CHECK(S) FAILED`);
       process.exit(1);
@@ -200,9 +201,9 @@ main()
     console.log("\nALL SMOKE CHECKS PASSED");
     process.exit(0);
   })
-  .catch((err) => {
+  .catch(async (err) => {
     console.error("\nSMOKE TEST ERROR:", err);
-    proc.kill();
-    try { fs.rmSync(storePath, { recursive: true, force: true }); } catch {}
+    await gracefulStop(proc);
+    rmRetry(storePath);
     process.exit(1);
   });

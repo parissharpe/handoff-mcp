@@ -176,9 +176,24 @@ function asText(payload: unknown) {
   };
 }
 
+const MAX_LIMIT = 100;
+
+/** Coerce a limit-like value into [1, MAX_LIMIT], falling back when invalid. */
 function num(value: unknown, fallback: number): number {
   const n = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.floor(n), MAX_LIMIT);
+}
+
+/** Validate an optional ISO-8601 `since` filter; throws on a malformed value. */
+function parseSince(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+    throw new Error(
+      "`since` must be an ISO-8601 timestamp string (e.g. 2026-06-06T00:00:00Z)",
+    );
+  }
+  return value;
 }
 
 /** Split the comma-joined `tags` string back into an array for output. */
@@ -209,8 +224,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "get_recent_cowork_context": {
         const limit = num(args.limit, 5);
-        const since =
-          typeof args.since === "string" ? args.since : undefined;
+        const since = parseSince(args.since);
         let items = await store.listRecent(COWORK_COLLECTION, limit + 25);
         if (since) {
           items = items.filter(

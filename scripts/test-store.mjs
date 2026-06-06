@@ -99,6 +99,8 @@ try {
 
   console.log("\nALL STORE TESTS PASSED");
 } finally {
-  if (server) server.stop();
+  if (server) await server.stop(); // graceful: flush + release port before cleanup
+  const { rmRetry } = await import("./_harness.mjs");
+  rmRetry(tmp);
 }
 process.exit(0);

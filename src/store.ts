@@ -361,13 +361,30 @@ async function stopServer(
   const pid = proc.pid;
   if (pid === undefined) return;
 
-  const waitForPortFree = async (ms: number): Promise<boolean> => {
+  const hasExited = () => proc.exitCode !== null || proc.signalCode !== null;
+  // Resolve when the child process actually exits (releasing its file handles
+  // on the store dir), or after `ms`. Waiting on exit — not just the port — is
+  // what lets callers safely delete the store directory afterward.
+  const waitForExit = (ms: number): Promise<boolean> =>
+    new Promise((resolve) => {
+      if (hasExited()) return resolve(true);
+      let done = false;
+      const finish = () => {
+        if (!done) {
+          done = true;
+          resolve(hasExited());
+        }
+      };
+      proc.once("exit", finish);
+      setTimeout(finish, ms);
+    });
+
+  const waitForPortFree = async (ms: number): Promise<void> => {
     const until = Date.now() + ms;
     while (Date.now() < until) {
-      if (await isPortFree(port)) return true;
+      if (await isPortFree(port)) return;
       await sleep(150);
     }
-    return false;
   };
 
   // 1) Graceful request.
@@ -376,15 +393,19 @@ async function stopServer(
   } else {
     try { proc.kill("SIGTERM"); } catch { /* already gone */ }
   }
-  if (await waitForPortFree(5000)) return;
+  if (await waitForExit(4000)) {
+    await waitForPortFree(2000);
+    return;
+  }
 
-  // 2) Force fallback.
+  // 2) Force fallback — ensure the process is truly gone, then the port.
   if (process.platform === "win32") {
     spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
   } else {
     try { proc.kill("SIGKILL"); } catch { /* already gone */ }
   }
-  await waitForPortFree(3000);
+  await waitForExit(4000);
+  await waitForPortFree(2000);
 }
 
 /**

@@ -14,8 +14,10 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "test:store": "node scripts/test-store.mjs",
+    "test:restart": "node scripts/test-restart.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "test:integration": "node scripts/integration.mjs"
+    "test:integration": "node scripts/integration.mjs",
+    "test": "node scripts/test-store.mjs && node scripts/test-restart.mjs && node scripts/smoke.mjs && node scripts/integration.mjs"
   },
   "engines": {
     "node": ">=18"

@@ -14,23 +14,14 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { findPython, gracefulStop, rmRetry } from "./_harness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
 const PORT = "8977";
 
-// Locate Python (the watcher install). Override with HANDOFF_PYTHON if needed.
-const PYTHON =
-  process.env.HANDOFF_PYTHON ||
-  path.join(
-    os.homedir(),
-    "AppData",
-    "Local",
-    "Programs",
-    "Python",
-    "Python312",
-    "python.exe",
-  );
+// Locate Python (the watcher install) in a CI-portable way.
+const PYTHON = findPython();
 
 const storePath = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-int-store-"));
 const coworkDir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-int-cowork-"));
@@ -88,32 +79,10 @@ function check(cond, msg) {
   console.log(`${cond ? "PASS" : "FAIL"}  ${msg}`);
 }
 
-function killTree() {
-  // On Windows, proc.kill() force-terminates Node without running its SIGTERM
-  // handler, orphaning the grandchild Chroma server (which holds the store
-  // lock). taskkill /T kills the whole tree so the store dir can be removed.
-  if (process.platform === "win32" && proc.pid) {
-    spawnSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
-  } else {
-    try { proc.kill(); } catch {}
-  }
-}
-
-function rmRetry(dir) {
-  for (let i = 0; i < 10; i++) {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-      return;
-    } catch {
-      // Server may still be releasing file handles; wait and retry.
-      const until = Date.now() + 300;
-      while (Date.now() < until) { /* brief spin */ }
-    }
-  }
-}
-
-function cleanup() {
-  killTree();
+async function cleanup() {
+  // Graceful stop: closing stdin lets the MCP server stop its Chroma child
+  // cleanly (flush + release port), so the store dir is unlocked for removal.
+  await gracefulStop(proc);
   rmRetry(storePath);
   rmRetry(coworkDir);
 }
@@ -185,8 +154,8 @@ async function main() {
 }
 
 main()
-  .then(() => {
-    cleanup();
+  .then(async () => {
+    await cleanup();
     if (failures.length) {
       console.error(`\n${failures.length} CHECK(S) FAILED`);
       process.exit(1);
@@ -194,8 +163,8 @@ main()
     console.log("\nALL INTEGRATION CHECKS PASSED (MCP + watcher share one server)");
     process.exit(0);
   })
-  .catch((err) => {
+  .catch(async (err) => {
     console.error("\nINTEGRATION ERROR:", err);
-    cleanup();
+    await cleanup();
     process.exit(1);
   });

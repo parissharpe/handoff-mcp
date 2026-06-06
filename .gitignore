@@ -1,6 +1,9 @@
 node_modules/
 dist/
 *.log
+
+# Local Claude Code settings
+.claude/
 .env
 .env.*
 !.env.example

@@ -23,3 +23,7 @@ store/db/
 # Guard against stray in-repo Chroma stores (e.g. from a mangled store path)
 **/chroma.sqlite3
 Usersparis*/
+
+# Packaged extension bundles. These are build outputs, are hundreds of MB
+# because they carry the whole node_modules tree, and must never be committed.
+*.mcpb

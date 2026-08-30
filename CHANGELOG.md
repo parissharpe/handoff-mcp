@@ -77,7 +77,8 @@ subtree reachable only through `@chroma-core/default-embed` — its ONNX and
 transformers dependencies. Embedding runs in-process on the Node side, so this
 is a real runtime requirement, not dead weight. Peak memory is roughly 863 MB
 and the first embedding call costs about 2.5 seconds cold. Read-only tools that
-do not embed respond in under 20 ms.
+do not embed respond in under 20 ms. (These figures were measured on v0.3.0 and
+have not been re-measured; the code paths they cover are unchanged in v0.4.0.)
 
 `onnxruntime-web`, roughly 90 MB of that tree, is never loaded at runtime on
 Node. Excluding it from packaged builds is planned but not yet done.

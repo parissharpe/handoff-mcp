@@ -59,9 +59,12 @@ export function findPython() {
 }
 
 /** Spawn the compiled MCP server and return a small JSON-RPC client + control. */
-export function spawnMcp(env, { inheritStderr = true } = {}) {
+export function spawnMcp(env, { inheritStderr = true, cwd } = {}) {
   const proc = spawn(process.execPath, [path.join(ROOT, "dist", "index.js")], {
     env,
+    // Default to inheriting the runner's cwd. Tests that need to prove cwd
+    // independence pass an explicit one (see test-cwd.mjs).
+    ...(cwd ? { cwd } : {}),
     stdio: ["pipe", "pipe", inheritStderr ? "inherit" : "ignore"],
   });
   let buffer = "";

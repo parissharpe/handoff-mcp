@@ -1,5 +1,5 @@
 /**
- * End-to-end smoke test for handoff-mcp v0.3.0.
+ * End-to-end smoke test for handoff-mcp.
  *
  * Launches the compiled MCP server over stdio against a TEMP store + dedicated
  * Chroma port, then drives all five tools and asserts each returns a real data
@@ -16,6 +16,12 @@ import { gracefulStop, rmRetry } from "./_harness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
+
+// Read the expected version from package.json so a release bump can't leave a
+// stale hardcoded assertion behind.
+const PKG_VERSION = JSON.parse(
+  fs.readFileSync(path.join(ROOT, "package.json"), "utf8"),
+).version;
 
 const storePath = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-smoke-"));
 const PORT = "8973"; // unusual port to avoid clashing with a real server
@@ -101,7 +107,10 @@ async function main() {
     capabilities: {},
     clientInfo: { name: "smoke", version: "0" },
   });
-  check(init.result?.serverInfo?.version === "0.3.0", "server reports v0.3.0");
+  check(
+    init.result?.serverInfo?.version === PKG_VERSION,
+    `server reports v${PKG_VERSION} (package.json version)`,
+  );
   notify("notifications/initialized", {});
 
   // 2) tools/list shows all five

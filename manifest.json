@@ -1,0 +1,90 @@
+{
+  "manifest_version": "0.3",
+  "name": "handoff",
+  "display_name": "Handoff",
+  "version": "0.4.0",
+  "description": "Cross-product handoff context: recent cowork activity, recent code activity, and persistent strategist memory backed by Chroma.",
+  "author": {
+    "name": "Paris Sharpe",
+    "url": "https://oreb.ai"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/parissharpe/handoff-mcp"
+  },
+  "homepage": "https://github.com/parissharpe/handoff-mcp",
+  "keywords": [
+    "handoff",
+    "context",
+    "memory",
+    "chroma",
+    "strategist",
+    "cowork"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
+      "env": {
+        "HANDOFF_STORE_PATH": "${user_config.HANDOFF_STORE_PATH}",
+        "CODE_PROJECT_PATH": "${user_config.CODE_PROJECT_PATH}",
+        "COWORK_OUTPUT_FOLDER": "${user_config.COWORK_OUTPUT_FOLDER}"
+      }
+    }
+  },
+  "user_config": {
+    "HANDOFF_STORE_PATH": {
+      "type": "directory",
+      "title": "Handoff Store Path",
+      "description": "Directory where the Chroma-backed handoff store persists its data.",
+      "required": false,
+      "default": "${HOME}/.handoff/db"
+    },
+    "CODE_PROJECT_PATH": {
+      "type": "directory",
+      "title": "Code Project Path",
+      "description": "Root directory of the code project this Handoff instance follows.",
+      "required": true
+    },
+    "COWORK_OUTPUT_FOLDER": {
+      "type": "directory",
+      "title": "Cowork Output Folder",
+      "description": "Optional directory containing Cowork session outputs to index.",
+      "required": false
+    }
+  },
+  "tools": [
+    {
+      "name": "get_recent_cowork_context",
+      "description": "Return recent cowork (collaboration) activity to bring a session up to speed."
+    },
+    {
+      "name": "get_recent_code_context",
+      "description": "Return recent code-related activity (commits, edits, reviews) for a workspace."
+    },
+    {
+      "name": "query_strategist_memory",
+      "description": "Search the persistent strategist memory for findings relevant to a query."
+    },
+    {
+      "name": "write_strategist_finding",
+      "description": "Persist a new strategist finding to memory for later retrieval."
+    },
+    {
+      "name": "get_cross_product_brief",
+      "description": "Generate a brief that synthesizes context across products for a given topic."
+    }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "node": ">=18.0.0",
+      "python": ">=3.11"
+    }
+  }
+}

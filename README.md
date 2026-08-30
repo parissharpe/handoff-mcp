@@ -149,15 +149,24 @@ Point `CHROMA_HOST` / `CHROMA_PORT` at it if you use a non-default endpoint.
 
 ## Status
 
-**v0.3.0** — current release:
+**v0.4.0** — current release (see [CHANGELOG.md](CHANGELOG.md)):
 
 - ✅ MCP server with all five tools wired to a real ChromaDB store
 - ✅ Local vector store with `cowork_sessions`, `code_sessions`, and `strategist_memory` collections
 - ✅ Cowork watcher **and** Code watcher (Windows-first), both writing into the shared store over HTTP
 - ✅ Single shared Chroma server coordinated via a `server.json` endpoint file, with graceful shutdown and a startup readiness gate (no empty-read races on restart)
 - ✅ Local embeddings, no API key required
+- ✅ Starts correctly from any working directory (Windows x64 binding resolution fixed in v0.4.0)
+- ✅ Attached clients recover when the shared-server owner exits
 
 **Ideas for later (build only if the community asks):** Obsidian export, multi-project support, custom embedding-model selection, a web UI for browsing the local store.
+
+---
+
+## Backlog
+
+- **Bundling / packaging.** `.mcpb` install on the Microsoft Store build of Claude Desktop can exceed the Windows 260-character path limit during extraction, because the MSIX data redirect adds about 52 characters to the install prefix. Enabling `LongPathsEnabled` does not resolve this on its own. The overflowing paths belong to `onnxruntime-web` under `@chroma-core/default-embed` — roughly 90 MB that is never loaded at runtime on Node and could be excluded from packaged builds. Registering via `claude mcp add` is unaffected, since nothing is extracted.
+- **Tool annotations.** `readOnlyHint`, `destructiveHint`, and `title` are not yet declared on any of the five tools.
 
 ---
 

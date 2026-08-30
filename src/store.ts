@@ -67,6 +67,50 @@ export const KNOWN_COLLECTIONS = [
   "strategist_memory",
 ] as const;
 
+/**
+ * Read an environment variable, treating empty/whitespace-only as unset.
+ *
+ * MCP hosts commonly materialize optional config as `""` rather than omitting
+ * the key. Plain `??` only guards `undefined`, so `CHROMA_HOST=""` used to slip
+ * through and produce an endpoint like "http://:8000".
+ */
+export function envVar(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Numeric form of `envVar`; returns undefined when unset or not a finite number. */
+export function envNum(name: string): number | undefined {
+  const raw = envVar(name);
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * True when `error` looks like the Chroma endpoint being unreachable, rather
+ * than a bad request. Used to decide whether a cached client is worth
+ * discarding and re-resolving — see `getStore` in index.ts.
+ *
+ * The owner of a shared server tears it down when it exits, so an attached
+ * process can hold a client whose endpoint has since gone away.
+ */
+export function isConnectionError(error: unknown): boolean {
+  const message =
+    error instanceof Error ? error.message : String(error ?? "");
+  const code = (error as { code?: unknown } | null)?.code;
+  const codeStr = typeof code === "string" ? code : "";
+  return (
+    /failed to connect to chromadb/i.test(message) ||
+    /fetch failed/i.test(message) ||
+    /ECONNREFUSED|ECONNRESET|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT|UND_ERR/i.test(
+      `${message} ${codeStr}`,
+    )
+  );
+}
+
 /** A single result row returned by `query` / `listRecent`. */
 export interface StoreRecord {
   id: string;
@@ -241,10 +285,8 @@ export class Store {
   >();
 
   constructor(args?: { host?: string; port?: number; ssl?: boolean }) {
-    const host = args?.host ?? process.env.CHROMA_HOST ?? "localhost";
-    const port =
-      args?.port ??
-      (process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : 8000);
+    const host = args?.host ?? envVar("CHROMA_HOST") ?? "localhost";
+    const port = args?.port ?? envNum("CHROMA_PORT") ?? DEFAULT_PORT;
     const ssl = args?.ssl ?? false;
     this.client = new ChromaClient({ host, port, ssl });
   }
@@ -433,14 +475,15 @@ export async function startLocalServer(opts?: {
   stop: () => Promise<void>;
 }> {
   const storePath = opts?.storePath ?? resolveStorePath();
-  const host = opts?.host ?? process.env.CHROMA_HOST ?? "localhost";
+  const host = opts?.host ?? envVar("CHROMA_HOST") ?? "localhost";
   const timeoutMs = opts?.timeoutMs ?? 30_000;
 
+  const envPort = envNum("CHROMA_PORT");
   let port: number;
   if (opts?.port !== undefined) {
     port = opts.port;
-  } else if (process.env.CHROMA_PORT) {
-    port = Number(process.env.CHROMA_PORT);
+  } else if (envPort !== undefined) {
+    port = envPort;
   } else {
     port = (await isPortFree(DEFAULT_PORT)) ? DEFAULT_PORT : await getFreePort();
   }
@@ -448,18 +491,22 @@ export async function startLocalServer(opts?: {
   let proc: ChildProcess;
   if (process.platform === "win32" && process.arch === "x64") {
     // Bypass the broken CLI arch guard by loading the native binding directly.
+    //
+    // Resolve the binding HERE, relative to this module, and hand the child an
+    // absolute path. Resolving in the child against process.cwd() broke every
+    // launch from outside the repo root — which is what any normal MCP host
+    // registration does. See regression test scripts/test-cwd.mjs.
+    const require = createRequire(import.meta.url);
+    const bindingPath = require.resolve("chromadb-js-bindings-win32-x64-msvc");
     const bootstrap = [
-      "const { createRequire } = require('node:module');",
-      "const require2 = createRequire(process.env.HANDOFF_REQUIRE_BASE);",
-      "const b = require('chromadb-js-bindings-win32-x64-msvc');",
+      "const b = require(process.env.HANDOFF_BINDING_PATH);",
       "b.cli(['chroma','run','--path',process.env.HANDOFF_CHROMA_PATH,",
       "'--host',process.env.HANDOFF_CHROMA_HOST,'--port',process.env.HANDOFF_CHROMA_PORT]);",
     ].join("");
     proc = spawn(process.execPath, ["-e", bootstrap], {
       env: {
         ...process.env,
-        // createRequire needs a base inside this project to resolve the binding.
-        HANDOFF_REQUIRE_BASE: path.join(process.cwd(), "package.json"),
+        HANDOFF_BINDING_PATH: bindingPath,
         HANDOFF_CHROMA_PATH: storePath,
         HANDOFF_CHROMA_HOST: host,
         HANDOFF_CHROMA_PORT: String(port),
@@ -534,10 +581,8 @@ export async function ensureServer(opts?: { storePath?: string }): Promise<{
   stop: () => Promise<void>;
 }> {
   const storePath = opts?.storePath ?? resolveStorePath();
-  const envHost = process.env.CHROMA_HOST;
-  const envPort = process.env.CHROMA_PORT
-    ? Number(process.env.CHROMA_PORT)
-    : undefined;
+  const envHost = envVar("CHROMA_HOST");
+  const envPort = envNum("CHROMA_PORT");
 
   const candidates: Endpoint[] = [];
   if (envHost || envPort) {

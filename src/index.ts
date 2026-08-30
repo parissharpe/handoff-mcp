@@ -6,15 +6,15 @@ import {
   ListToolsRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Store, ensureServer } from "./store.js";
+import { Store, ensureServer, isConnectionError } from "./store.js";
 
 /**
  * handoff-mcp
  *
  * An MCP server that surfaces cross-product "handoff" context: recent cowork
  * activity, recent code activity, and a persistent strategist memory. Every
- * tool below is currently a stub that echoes its arguments — the real data
- * sources (ChromaDB, file watchers, etc.) will be wired in later.
+ * tool reads and writes a ChromaDB-backed store (see store.ts) that the Python
+ * watchers in watchers/ write into over the same shared Chroma server.
  */
 
 const TOOLS: Tool[] = [
@@ -39,7 +39,10 @@ const TOOLS: Tool[] = [
   {
     name: "get_recent_code_context",
     description:
-      "Return recent code-related activity (commits, edits, reviews) for a workspace.",
+      "Return recently indexed code-project context for a workspace. The code " +
+      "watcher indexes CLAUDE.md, CLAUDE.local.md, transcripts/ and .claude/ " +
+      "directories, and .jsonl files; this returns that indexed text. Does not " +
+      "read git history.",
     inputSchema: {
       type: "object",
       properties: {
@@ -96,13 +99,21 @@ const TOOLS: Tool[] = [
   {
     name: "get_cross_product_brief",
     description:
-      "Generate a brief that synthesizes context across products for a given topic.",
+      "Retrieve items relevant to a topic from all three collections (cowork " +
+      "activity, code activity, strategist memory) and return them as three " +
+      "labeled buckets with similarity distances. Runs one similarity query " +
+      "per collection; does not summarize or synthesize the results.",
     inputSchema: {
       type: "object",
       properties: {
         topic: {
           type: "string",
           description: "The topic or area to brief on.",
+        },
+        limit: {
+          type: "number",
+          description:
+            "Maximum number of items to return per collection. Defaults to 3.",
         },
       },
       required: ["topic"],
@@ -113,7 +124,7 @@ const TOOLS: Tool[] = [
 const server = new Server(
   {
     name: "handoff-mcp",
-    version: "0.3.0",
+    version: "0.4.0",
   },
   {
     capabilities: {
@@ -138,6 +149,14 @@ const STRATEGIST_COLLECTION = "strategist_memory";
 // CHROMA_HOST/PORT or the server.json endpoint file) or starts one backed by
 // HANDOFF_STORE_PATH and owns its lifecycle. This keeps tools/list working
 // without Chroma and defers the model load until it's actually needed.
+//
+// STALE-CLIENT RECOVERY: the process that starts the shared server tears it
+// down when it exits. An attached process therefore can hold a client whose
+// endpoint has gone away — closing Claude Desktop used to silently break a
+// running Claude Code session (and the reverse). `withStore` retries once on a
+// connection-level failure, dropping the cached client so the next resolve
+// either finds a live server or starts a fresh one. Ownership is unchanged: a
+// process that attached to someone else's server still cannot shut it down.
 // ---------------------------------------------------------------------------
 let storePromise: Promise<Store> | null = null;
 let stopOwnedServer: (() => Promise<void>) | null = null;
@@ -165,6 +184,34 @@ function getStore(): Promise<Store> {
     });
   }
   return storePromise;
+}
+
+/**
+ * Drop the cached Store so the next `getStore()` re-resolves an endpoint.
+ *
+ * Only clears our own ownership handle — it does not stop a server we started,
+ * because the point of invalidating is that the endpoint is already gone.
+ */
+function invalidateStore(): void {
+  storePromise = null;
+  stopOwnedServer = null;
+}
+
+/**
+ * Run `fn` against a connected Store, retrying once if the endpoint turns out
+ * to be dead. A second connection failure is surfaced to the caller.
+ */
+async function withStore<T>(fn: (store: Store) => Promise<T>): Promise<T> {
+  try {
+    return await fn(await getStore());
+  } catch (error) {
+    if (!isConnectionError(error)) throw error;
+    console.error(
+      "handoff-mcp: Chroma endpoint unreachable, re-resolving the shared server",
+    );
+    invalidateStore();
+    return fn(await getStore());
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,8 +266,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   try {
-    const store = await getStore();
-
+    return await withStore(async (store) => {
     switch (name) {
       case "get_recent_cowork_context": {
         const limit = num(args.limit, 5);
@@ -305,12 +351,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const topic = typeof args.topic === "string" ? args.topic : "";
         if (!topic) throw new Error("`topic` is required");
         const perSource = num(args.limit, 3);
+        // A single unreadable collection degrades to an empty bucket, but a
+        // dead endpoint must propagate so withStore can re-resolve it —
+        // otherwise the brief silently reports zero hits for every source.
+        const softQuery = (collection: string) =>
+          store.query(collection, topic, perSource).catch((error: unknown) => {
+            if (isConnectionError(error)) throw error;
+            return [];
+          });
         const [cowork, code, memory] = await Promise.all([
-          store.query(COWORK_COLLECTION, topic, perSource).catch(() => []),
-          store.query(CODE_COLLECTION, topic, perSource).catch(() => []),
-          store
-            .query(STRATEGIST_COLLECTION, topic, perSource)
-            .catch(() => []),
+          softQuery(COWORK_COLLECTION),
+          softQuery(CODE_COLLECTION),
+          softQuery(STRATEGIST_COLLECTION),
         ]);
         const shape = (r: {
           id: string;
@@ -336,6 +388,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       default:
         throw new Error(`Unhandled tool: ${name}`);
     }
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -370,7 +423,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Use stderr so we don't corrupt the stdio JSON-RPC stream.
-  console.error("handoff-mcp v0.3.0 server running on stdio");
+  console.error("handoff-mcp v0.4.0 server running on stdio");
 }
 
 process.on("SIGINT", () => void shutdown(0));

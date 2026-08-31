@@ -54,7 +54,10 @@ SKIP_EXTENSIONS = {
     ".wav", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 }
 
-MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB (whole-file path only; chunked files stream)
+
+# Documents per upsert call when a file expands into many chunks.
+CHUNK_BATCH = 64
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +143,11 @@ def stable_id(abs_path: str) -> str:
     return hashlib.sha1(abs_path.encode("utf-8")).hexdigest()
 
 
+def chunk_id(abs_path: str, index: int) -> str:
+    """Stable id for chunk `index` of `abs_path`, so re-runs upsert in place."""
+    return hashlib.sha1(f"{abs_path}:{index}".encode("utf-8")).hexdigest()
+
+
 def should_skip(path: Path) -> bool:
     """True for temp/lock/binary files we should ignore."""
     name = path.name
@@ -221,6 +229,11 @@ class Indexer:
       relevant        : optional predicate(Path)->bool; default indexes any text file
       extra_metadata  : optional callable(Path)->dict of extra primitive fields
       prune_dirs      : directory names to skip entirely (e.g. node_modules)
+      chunker         : optional object with .handles(Path)->bool and
+                        .parse(Path)->(chunks, stats). When it claims a file the
+                        file becomes MANY documents instead of one — see
+                        _transcripts.py. Chunked files bypass MAX_FILE_BYTES
+                        because they are streamed, never read whole.
     """
 
     def __init__(
@@ -231,12 +244,14 @@ class Indexer:
         relevant: Optional[Callable[[Path], bool]] = None,
         extra_metadata: Optional[Callable[[Path], dict]] = None,
         prune_dirs: Optional[Iterable[str]] = None,
+        chunker: object | None = None,
     ) -> None:
         self.collection = collection
         self.source = source
         self.relevant = relevant or (lambda _p: True)
         self.extra_metadata = extra_metadata or (lambda _p: {})
         self.prune_dirs = {d.lower() for d in (prune_dirs or [])}
+        self.chunker = chunker
 
     def _is_pruned(self, path: Path) -> bool:
         if not self.prune_dirs:
@@ -262,6 +277,12 @@ class Indexer:
 
         if not force and not _changed_since_last(abs_path, mtime, size):
             return False
+
+        # Chunked path: one file becomes many documents. Streamed, so the
+        # MAX_FILE_BYTES whole-file guard deliberately does not apply here.
+        if self.chunker is not None and self.chunker.handles(p):
+            return self._index_chunked(p, abs_path, mtime)
+
         if not is_probably_text(p):
             return False
 
@@ -288,6 +309,82 @@ class Indexer:
             upsert(documents=[text], ids=[doc_id], metadatas=[metadata])
         else:  # pragma: no cover - older chromadb fallback
             collection.add(documents=[text], ids=[doc_id], metadatas=[metadata])
+        return True
+
+    def _base_metadata(self, p: Path, abs_path: str, mtime: float) -> dict:
+        meta = {
+            "source": self.source,
+            "type": self.source,
+            "path": abs_path,
+            "filename": p.name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "modified_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+        }
+        for k, v in (self.extra_metadata(p) or {}).items():
+            meta[k] = v
+        return meta
+
+    def _index_chunked(self, p: Path, abs_path: str, mtime: float) -> bool:
+        """Index one file as many documents via self.chunker.
+
+        Emits a per-file diagnostic line, and a loud warning when a file parses
+        but yields no conversation — the signature of a transcript-format change.
+        """
+        try:
+            chunks, stats = self.chunker.parse(p)
+        except Exception as exc:  # never let one bad file kill the watcher
+            print(f"[{self.source}] PARSE FAILED {p}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return False
+
+        print(f"[{self.source}] {p.name}: {stats.summary()}")
+
+        if not chunks:
+            if stats.records_parsed:
+                print(
+                    f"[{self.source}] WARNING: {p} parsed {stats.records_parsed} record(s) "
+                    f"but produced ZERO text chunks. This is the signature of a transcript "
+                    f"schema change. Record types seen: {stats.histogram()}",
+                    file=sys.stderr,
+                )
+            return False
+
+        base = self._base_metadata(p, abs_path, mtime)
+        chunk_meta = self.chunker.metadata(p, stats) if hasattr(self.chunker, "metadata") else {}
+
+        ids, docs, metas = [], [], []
+        for ch in chunks:
+            meta = dict(base)
+            meta.update(chunk_meta)
+            meta["chunk_index"] = ch.index
+            meta["chunk_count"] = len(chunks)
+            if ch.first_timestamp:
+                meta["turn_timestamp"] = ch.first_timestamp
+            if ch.roles:
+                meta["roles"] = ch.roles
+            ids.append(chunk_id(abs_path, ch.index))
+            docs.append(ch.text)
+            metas.append(meta)
+
+        collection = get_collection(self.collection)
+        write = getattr(collection, "upsert", None) or collection.add
+        for i in range(0, len(ids), CHUNK_BATCH):
+            write(
+                ids=ids[i:i + CHUNK_BATCH],
+                documents=docs[i:i + CHUNK_BATCH],
+                metadatas=metas[i:i + CHUNK_BATCH],
+            )
+
+        # A re-index that produces fewer chunks than last time would otherwise
+        # leave orphans behind. Idempotence means dropping the tail.
+        try:
+            collection.delete(where={"$and": [
+                {"path": abs_path},
+                {"chunk_index": {"$gte": len(chunks)}},
+            ]})
+        except Exception:
+            pass  # best-effort; stale tail is harmless compared to a crash
+
         return True
 
     def initial_scan(self, folder) -> int:

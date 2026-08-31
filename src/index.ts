@@ -17,6 +17,21 @@ import { Store, ensureServer, isConnectionError } from "./store.js";
  * watchers in watchers/ write into over the same shared Chroma server.
  */
 
+/**
+ * Default page size for the search and recency tools.
+ *
+ * Interpolated into the tool descriptions below AND used as the handler
+ * fallback, so the declared default and the actual default cannot drift apart —
+ * `get_cross_product_brief` previously advertised 3 while two sibling tools
+ * silently used 5.
+ *
+ * 8 rather than 3: retrieval here is good at putting a relevant document in the
+ * page and less good at putting it first. Measured on 688 real documents, a
+ * known-good chunk for a loosely-worded query sat at rank 6 — inside a page of
+ * 8, invisible in a page of 3.
+ */
+const DEFAULT_LIMIT = 8;
+
 const TOOLS: Tool[] = [
   {
     name: "get_recent_cowork_context",
@@ -52,7 +67,7 @@ const TOOLS: Tool[] = [
         },
         limit: {
           type: "number",
-          description: "Maximum number of recent items to return.",
+          description: `Maximum number of recent items to return. Defaults to ${DEFAULT_LIMIT}.`,
         },
       },
     },
@@ -70,7 +85,7 @@ const TOOLS: Tool[] = [
         },
         limit: {
           type: "number",
-          description: "Maximum number of matching findings to return.",
+          description: `Maximum number of matching findings to return. Defaults to ${DEFAULT_LIMIT}.`,
         },
       },
       required: ["query"],
@@ -113,7 +128,13 @@ const TOOLS: Tool[] = [
         limit: {
           type: "number",
           description:
-            "Maximum number of items to return per collection. Defaults to 3.",
+            `Maximum number of items to return per collection. Defaults to ${DEFAULT_LIMIT}.`,
+        },
+        repo: {
+          type: "string",
+          description:
+            "Optional project name or path. Scopes the code_sessions bucket " +
+            "only; cowork and strategist memory carry no project tag.",
         },
       },
       required: ["topic"],
@@ -124,7 +145,7 @@ const TOOLS: Tool[] = [
 const server = new Server(
   {
     name: "handoff-mcp",
-    version: "0.4.0",
+    version: "0.5.0",
   },
   {
     capabilities: {
@@ -243,6 +264,21 @@ function parseSince(value: unknown): string | undefined {
   return value;
 }
 
+/**
+ * Build a Chroma `where` clause matching a project identifier, or undefined.
+ *
+ * Accepts the project name (`repo`), its full path (`project_path`), or a
+ * document path — preserving what the old client-side filter matched, but
+ * evaluated server-side so it narrows the candidate set instead of trimming an
+ * already-truncated page.
+ */
+function repoWhere(repo: string | undefined): Record<string, unknown> | undefined {
+  if (!repo) return undefined;
+  return {
+    $or: [{ repo }, { project_path: repo }, { path: repo }],
+  };
+}
+
 /** Split the comma-joined `tags` string back into an array for output. */
 function decodeTags(meta: Record<string, unknown> | null): string[] {
   const raw = meta?.tags;
@@ -290,16 +326,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_recent_code_context": {
-        const limit = num(args.limit, 5);
+        const limit = num(args.limit, DEFAULT_LIMIT);
         const repo = typeof args.repo === "string" ? args.repo : undefined;
-        let items = await store.listRecent(CODE_COLLECTION, limit + 25);
-        if (repo) {
-          items = items.filter((r) => {
-            const m = r.metadata ?? {};
-            return m.repo === repo || m.path === repo || m.project === repo;
-          });
-        }
-        items = items.slice(0, limit);
+        // The filter goes to Chroma, so `limit` is a real limit: previously we
+        // took the newest limit+25 across ALL projects and filtered afterwards,
+        // which returned nothing for a project outside that global window.
+        const items = await store.listRecent(CODE_COLLECTION, limit, {
+          where: repoWhere(repo),
+        });
         return asText({
           collection: CODE_COLLECTION,
           repo: repo ?? null,
@@ -315,7 +349,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "query_strategist_memory": {
         const query = typeof args.query === "string" ? args.query : "";
         if (!query) throw new Error("`query` is required");
-        const limit = num(args.limit, 5);
+        const limit = num(args.limit, DEFAULT_LIMIT);
         const results = await store.query(STRATEGIST_COLLECTION, query, limit);
         return asText({
           collection: STRATEGIST_COLLECTION,
@@ -350,18 +384,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_cross_product_brief": {
         const topic = typeof args.topic === "string" ? args.topic : "";
         if (!topic) throw new Error("`topic` is required");
-        const perSource = num(args.limit, 3);
+        const perSource = num(args.limit, DEFAULT_LIMIT);
+        const repo = typeof args.repo === "string" ? args.repo : undefined;
         // A single unreadable collection degrades to an empty bucket, but a
         // dead endpoint must propagate so withStore can re-resolve it —
         // otherwise the brief silently reports zero hits for every source.
-        const softQuery = (collection: string) =>
-          store.query(collection, topic, perSource).catch((error: unknown) => {
+        const softQuery = (
+          collection: string,
+          where?: Record<string, unknown>,
+        ) =>
+          store.query(collection, topic, perSource, { where }).catch((error: unknown) => {
             if (isConnectionError(error)) throw error;
             return [];
           });
+        // `repo` scopes the code bucket only. Cowork and strategist documents
+        // carry no project tag, so applying it there would empty them rather
+        // than filter them.
         const [cowork, code, memory] = await Promise.all([
           softQuery(COWORK_COLLECTION),
-          softQuery(CODE_COLLECTION),
+          softQuery(CODE_COLLECTION, repoWhere(repo)),
           softQuery(STRATEGIST_COLLECTION),
         ]);
         const shape = (r: {
@@ -372,6 +413,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }) => ({ id: r.id, content: r.document, distance: r.distance ?? null });
         return asText({
           topic,
+          repo: repo ?? null,
           sources: {
             cowork_sessions: cowork.map(shape),
             code_sessions: code.map(shape),
@@ -423,7 +465,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Use stderr so we don't corrupt the stdio JSON-RPC stream.
-  console.error("handoff-mcp v0.4.0 server running on stdio");
+  console.error("handoff-mcp v0.5.0 server running on stdio");
 }
 
 process.on("SIGINT", () => void shutdown(0));

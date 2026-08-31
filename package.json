@@ -1,6 +1,6 @@
 {
   "name": "handoff-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP server providing cross-product handoff context for strategist and code workflows.",
   "type": "module",
   "bin": {
@@ -18,9 +18,11 @@
     "test:cwd": "node scripts/test-cwd.mjs",
     "test:owner-exit": "node scripts/test-owner-exit.mjs",
     "test:env-empty": "node scripts/test-env-empty.mjs",
+    "test:recency": "node scripts/test-recency.mjs",
+    "test:hybrid": "node scripts/test-hybrid.mjs",
     "smoke": "node scripts/smoke.mjs",
     "test:integration": "node scripts/integration.mjs",
-    "test": "node scripts/test-store.mjs && node scripts/test-restart.mjs && node scripts/test-cwd.mjs && node scripts/test-owner-exit.mjs && node scripts/test-env-empty.mjs && node scripts/smoke.mjs && node scripts/integration.mjs",
+    "test": "node scripts/test-store.mjs && node scripts/test-restart.mjs && node scripts/test-cwd.mjs && node scripts/test-owner-exit.mjs && node scripts/test-env-empty.mjs && node scripts/test-recency.mjs && node scripts/test-hybrid.mjs && node scripts/smoke.mjs && node scripts/integration.mjs",
     "demo": "node demo/seed.mjs"
   },
   "engines": {

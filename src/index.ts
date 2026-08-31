@@ -17,6 +17,21 @@ import { Store, ensureServer, isConnectionError } from "./store.js";
  * watchers in watchers/ write into over the same shared Chroma server.
  */
 
+/**
+ * Default page size for the search and recency tools.
+ *
+ * Interpolated into the tool descriptions below AND used as the handler
+ * fallback, so the declared default and the actual default cannot drift apart —
+ * `get_cross_product_brief` previously advertised 3 while two sibling tools
+ * silently used 5.
+ *
+ * 8 rather than 3: retrieval here is good at putting a relevant document in the
+ * page and less good at putting it first. Measured on 688 real documents, a
+ * known-good chunk for a loosely-worded query sat at rank 6 — inside a page of
+ * 8, invisible in a page of 3.
+ */
+const DEFAULT_LIMIT = 8;
+
 const TOOLS: Tool[] = [
   {
     name: "get_recent_cowork_context",
@@ -52,7 +67,7 @@ const TOOLS: Tool[] = [
         },
         limit: {
           type: "number",
-          description: "Maximum number of recent items to return.",
+          description: `Maximum number of recent items to return. Defaults to ${DEFAULT_LIMIT}.`,
         },
       },
     },
@@ -70,7 +85,7 @@ const TOOLS: Tool[] = [
         },
         limit: {
           type: "number",
-          description: "Maximum number of matching findings to return.",
+          description: `Maximum number of matching findings to return. Defaults to ${DEFAULT_LIMIT}.`,
         },
       },
       required: ["query"],
@@ -113,7 +128,7 @@ const TOOLS: Tool[] = [
         limit: {
           type: "number",
           description:
-            "Maximum number of items to return per collection. Defaults to 3.",
+            `Maximum number of items to return per collection. Defaults to ${DEFAULT_LIMIT}.`,
         },
         repo: {
           type: "string",
@@ -311,7 +326,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_recent_code_context": {
-        const limit = num(args.limit, 5);
+        const limit = num(args.limit, DEFAULT_LIMIT);
         const repo = typeof args.repo === "string" ? args.repo : undefined;
         // The filter goes to Chroma, so `limit` is a real limit: previously we
         // took the newest limit+25 across ALL projects and filtered afterwards,
@@ -334,7 +349,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "query_strategist_memory": {
         const query = typeof args.query === "string" ? args.query : "";
         if (!query) throw new Error("`query` is required");
-        const limit = num(args.limit, 5);
+        const limit = num(args.limit, DEFAULT_LIMIT);
         const results = await store.query(STRATEGIST_COLLECTION, query, limit);
         return asText({
           collection: STRATEGIST_COLLECTION,
@@ -369,7 +384,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_cross_product_brief": {
         const topic = typeof args.topic === "string" ? args.topic : "";
         if (!topic) throw new Error("`topic` is required");
-        const perSource = num(args.limit, 3);
+        const perSource = num(args.limit, DEFAULT_LIMIT);
         const repo = typeof args.repo === "string" ? args.repo : undefined;
         // A single unreadable collection degrades to an empty bucket, but a
         // dead endpoint must propagate so withStore can re-resolve it —

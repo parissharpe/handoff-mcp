@@ -112,6 +112,109 @@ export function isConnectionError(error: unknown): boolean {
   );
 }
 
+/**
+ * Patterns for tokens that look like SYMBOLS rather than prose.
+ *
+ * The embedding model (all-MiniLM-L6-v2) reliably fails on these: an exact
+ * identifier present in 35 documents still loses to a topical summary, because
+ * a 384-dim general-purpose sentence vector has nowhere to put "this exact rare
+ * string appears here". A substring pre-filter is the cheap complement.
+ *
+ *  1. snake_case / SCREAMING_SNAKE, INCLUDING a trailing underscore, so a
+ *     query mentioning `VITE_` matches every `VITE_*` variable by prefix.
+ *  2. camelCase / PascalCase runs.
+ *  3. dotted identifiers and filenames (`store.ts`, `package.json`, `a.b.c`).
+ */
+const RARE_TOKEN_PATTERNS: RegExp[] = [
+  /[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]*)+/g,
+  /\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]+)+\b/g,
+  /\b[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\b/g,
+];
+
+/** Shortest token worth filtering on; below this the match is mostly noise. */
+const MIN_RARE_TOKEN = 5;
+
+/** Most tokens to filter on, longest (most specific) first. */
+const MAX_RARE_TOKENS = 3;
+
+/** Prose abbreviations that the dotted pattern would otherwise catch. */
+const RARE_TOKEN_STOPLIST = new Set(["e.g.", "i.e.", "etc.", "vs.", "a.k.a."]);
+
+/**
+ * Extract symbol-like tokens from a query, longest first.
+ *
+ * Returns an empty array for ordinary prose, which is what keeps the
+ * no-rare-token path byte-identical to pure vector search.
+ */
+export function rareTokens(text: string): string[] {
+  const found = new Set<string>();
+  for (const pattern of RARE_TOKEN_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      const token = match[0];
+      if (token.length < MIN_RARE_TOKEN) continue;
+      if (RARE_TOKEN_STOPLIST.has(token.toLowerCase())) continue;
+      found.add(token);
+    }
+  }
+  return [...found]
+    .sort((a, b) => b.length - a.length || a.localeCompare(b))
+    .slice(0, MAX_RARE_TOKENS);
+}
+
+/** Chroma `where_document` clause matching any of `tokens`, or undefined. */
+function containsAny(tokens: string[]): Record<string, unknown> | undefined {
+  if (tokens.length === 0) return undefined;
+  if (tokens.length === 1) return { $contains: tokens[0] };
+  // validateWhereDocument requires $or to hold at least two expressions.
+  return { $or: tokens.map((t) => ({ $contains: t })) };
+}
+
+/**
+ * Reciprocal Rank Fusion over ranked lists.
+ *
+ * Chosen over "keyword hits first" because both input lists are already ranked
+ * by vector distance — the keyword list is simply the same ranking restricted
+ * to documents containing the identifier. Concatenating would let a weak
+ * keyword match outrank a strong semantic one; RRF instead promotes documents
+ * that BOTH contain the token and sit close in embedding space, which is
+ * exactly the "I know this symbol appears in the answer" case. It also needs no
+ * arbitrary keyword score to compare against an L2 distance, and collapses to
+ * the vector ordering when the keyword list is empty.
+ */
+const RRF_K = 60;
+
+/**
+ * Candidate depth per list before fusion.
+ *
+ * Fusion can only reorder what it is given: fetching just `n` per list means a
+ * document ranked n+1 in the keyword list can never be promoted, which defeats
+ * the point. Both lists are drawn deeper, fused, then truncated to `n`.
+ */
+function candidatePool(n: number): number {
+  return Math.max(n * 4, 20);
+}
+
+function fuse(lists: StoreRecord[][], n: number): StoreRecord[] {
+  const scores = new Map<string, number>();
+  const byId = new Map<string, StoreRecord>();
+  for (const list of lists) {
+    list.forEach((record, rank) => {
+      scores.set(record.id, (scores.get(record.id) ?? 0) + 1 / (RRF_K + rank));
+      const existing = byId.get(record.id);
+      if (!existing || existing.distance == null) byId.set(record.id, record);
+    });
+  }
+  return [...scores.entries()]
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      const da = byId.get(a[0])?.distance ?? Number.POSITIVE_INFINITY;
+      const db = byId.get(b[0])?.distance ?? Number.POSITIVE_INFINITY;
+      return da - db;
+    })
+    .slice(0, n)
+    .map(([id]) => byId.get(id)!);
+}
+
 /** A single result row returned by `query` / `listRecent`. */
 export interface StoreRecord {
   id: string;
@@ -352,32 +455,74 @@ export class Store {
   }
 
   /**
-   * Semantic/text query against `collection`. Returns up to `n` results,
-   * each with its document, metadata, id, and similarity distance.
+   * Semantic query against `collection`, with a keyword pre-filter when the
+   * query mentions a symbol-like token. Returns up to `n` results.
+   *
+   * HYBRID RETRIEVAL. all-MiniLM-L6-v2 will not rank an exact rare identifier
+   * above a topical summary — measured here, `get_building_demand` appears in
+   * 35 documents and still lost to a memory index. When `rareTokens` finds a
+   * symbol, a second pass runs the same vector query restricted to documents
+   * that literally contain it (Chroma `where_document` `$contains`, verified
+   * case-SENSITIVE against chromadb 3.4.3), and the two ranked lists are fused
+   * by Reciprocal Rank Fusion.
+   *
+   * For ordinary prose no token is found and this is exactly one vector query,
+   * identical to the pre-hybrid behaviour. Pass `hybrid: false` to force that.
    */
   async query(
     collection: string,
     queryText: string,
     n: number,
-    opts?: { where?: Record<string, unknown> },
+    opts?: { where?: Record<string, unknown>; hybrid?: boolean },
   ): Promise<StoreRecord[]> {
     return retry(async () => {
       const col = await this.getCollection(collection);
-      const res = await col.query({
-        queryTexts: [queryText],
-        nResults: n,
-        ...(opts?.where ? { where: opts.where as never } : {}),
-      });
-      const ids = res.ids[0] ?? [];
-      const documents = res.documents[0] ?? [];
-      const metadatas = res.metadatas[0] ?? [];
-      const distances = res.distances[0] ?? [];
-      return ids.map((id, i) => ({
-        id,
-        document: documents[i] ?? null,
-        metadata: normalizeMetadata(metadatas[i]),
-        distance: distances[i] ?? null,
-      }));
+      const where = opts?.where ? { where: opts.where as never } : {};
+
+      const runQuery = async (
+        whereDocument?: Record<string, unknown>,
+        depth: number = n,
+      ): Promise<StoreRecord[]> => {
+        const res = await col.query({
+          queryTexts: [queryText],
+          nResults: depth,
+          ...where,
+          ...(whereDocument ? { whereDocument: whereDocument as never } : {}),
+        });
+        const ids = res.ids[0] ?? [];
+        const documents = res.documents[0] ?? [];
+        const metadatas = res.metadatas[0] ?? [];
+        const distances = res.distances[0] ?? [];
+        return ids.map((id, i) => ({
+          id,
+          document: documents[i] ?? null,
+          metadata: normalizeMetadata(metadatas[i]),
+          distance: distances[i] ?? null,
+        }));
+      };
+
+      // Pure prose, or hybrid explicitly disabled: unchanged single-query path,
+      // fetched at exactly `n` so the results are byte-identical to before.
+      const tokens = opts?.hybrid === false ? [] : rareTokens(queryText);
+      const clause = containsAny(tokens);
+      if (!clause) return runQuery();
+
+      const pool = candidatePool(n);
+      const vectorHits = await runQuery(undefined, pool);
+
+      // Keyword pass: the same vector ranking, restricted to documents that
+      // literally contain the identifier. Chroma returns an empty list (not an
+      // error) when nothing matches, so an absent token degrades to
+      // vector-only.
+      let keywordHits: StoreRecord[] = [];
+      try {
+        keywordHits = await runQuery(clause, pool);
+      } catch {
+        return vectorHits.slice(0, n); // a bad clause must never break search
+      }
+      if (keywordHits.length === 0) return vectorHits.slice(0, n);
+
+      return fuse([vectorHits, keywordHits], n);
     });
   }
 

@@ -44,7 +44,8 @@
  *
  * METADATA CONTRACT (shared with the Python watcher):
  *   - Every document's metadata carries `created_at`: an ISO-8601 string.
- *   - `listRecent` sorts by `created_at` descending.
+ *   - `listRecent` sorts by best-available CONTENT time: `turn_timestamp`,
+ *     then `modified_at`, then `created_at`, descending. See `recencyKey`.
  *   - ChromaDB metadata values must be primitives (string/number/bool), so
  *     array-valued `tags` are stored as a comma-joined STRING under the `tags`
  *     key (e.g. ["a","b"] -> "a,b"). Consumers should split on "," to recover
@@ -274,6 +275,30 @@ function normalizeMetadata(
 }
 
 /**
+ * Sort key for "most recent": the best available estimate of when a document's
+ * CONTENT happened. ISO-8601 sorts lexicographically, so plain compare works.
+ *
+ *   turn_timestamp  transcript chunks — when the conversation happened
+ *   modified_at     watcher-indexed files — the file's own mtime
+ *   created_at      strategist findings — written at the moment they were made
+ *
+ * `created_at` is last on purpose: for watcher-indexed documents it is index
+ * time, not content time. After a bulk backfill every such row shares a
+ * timestamp within seconds, which makes "recent" arbitrary — and worse, mixing
+ * index time with conversation time in one comparison lets a document indexed
+ * today outrank a conversation from last week purely because it was indexed
+ * later. Only fall through to it when nothing better exists.
+ */
+function recencyKey(meta: Record<string, unknown> | null): string {
+  const turn = meta?.turn_timestamp;
+  if (typeof turn === "string" && turn.length > 0) return turn;
+  const modified = meta?.modified_at;
+  if (typeof modified === "string" && modified.length > 0) return modified;
+  const created = meta?.created_at;
+  return typeof created === "string" ? created : "";
+}
+
+/**
  * ChromaDB-backed document store. Lazily connects to the configured Chroma
  * server and get-or-creates collections on demand.
  */
@@ -334,10 +359,15 @@ export class Store {
     collection: string,
     queryText: string,
     n: number,
+    opts?: { where?: Record<string, unknown> },
   ): Promise<StoreRecord[]> {
     return retry(async () => {
       const col = await this.getCollection(collection);
-      const res = await col.query({ queryTexts: [queryText], nResults: n });
+      const res = await col.query({
+        queryTexts: [queryText],
+        nResults: n,
+        ...(opts?.where ? { where: opts.where as never } : {}),
+      });
       const ids = res.ids[0] ?? [];
       const documents = res.documents[0] ?? [];
       const metadatas = res.metadatas[0] ?? [];
@@ -352,25 +382,58 @@ export class Store {
   }
 
   /**
-   * Return the `n` most recently added documents in `collection`, sorted by
-   * the `created_at` metadata field descending. Fetches all documents then
-   * sorts client-side (Chroma has no native order-by on metadata).
+   * Return the `n` most recent documents in `collection`.
+   *
+   * "Recent" means `turn_timestamp` when the document has one and `created_at`
+   * otherwise (see `recencyKey`). Optional `where` is pushed to Chroma so a
+   * filtered call narrows the candidate set server-side instead of fetching
+   * everything and filtering afterwards.
+   *
+   * Chroma exposes no order-by on metadata, so ranking still happens here; the
+   * two-pass fetch keeps that cost to metadata rather than full documents.
    */
-  async listRecent(collection: string, n: number): Promise<StoreRecord[]> {
+  async listRecent(
+    collection: string,
+    n: number,
+    opts?: { where?: Record<string, unknown> },
+  ): Promise<StoreRecord[]> {
     return retry(async () => {
       const col = await this.getCollection(collection);
-      const res = await col.get({ include: ["documents", "metadatas"] as never });
-      const records: StoreRecord[] = res.ids.map((id, i) => ({
-        id,
-        document: res.documents[i] ?? null,
-        metadata: normalizeMetadata(res.metadatas[i]),
-      }));
-      records.sort((a, b) => {
-        const aT = String(a.metadata?.created_at ?? "");
-        const bT = String(b.metadata?.created_at ?? "");
-        return bT.localeCompare(aT);
+      const where = opts?.where ? { where: opts.where as never } : {};
+
+      // Pass 1: metadata only. Chroma has no order-by, so the candidate set
+      // still has to be ranked here — but skipping `documents` keeps the
+      // transferred payload to the timestamps we actually sort on. A `where`
+      // narrows the candidate set server-side before any of that.
+      const index = await col.get({
+        include: ["metadatas"] as never,
+        ...where,
       });
-      return records.slice(0, n);
+      const ranked = index.ids
+        .map((id, i) => ({ id, metadata: normalizeMetadata(index.metadatas[i]) }))
+        .sort((a, b) => recencyKey(b.metadata).localeCompare(recencyKey(a.metadata)))
+        .slice(0, n);
+      if (ranked.length === 0) return [];
+
+      // Pass 2: fetch documents for the winners only.
+      const page = await col.get({
+        ids: ranked.map((r) => r.id),
+        include: ["documents", "metadatas"] as never,
+      });
+      const byId = new Map<string, { document: string | null; metadata: Record<string, unknown> | null }>();
+      page.ids.forEach((id, i) => {
+        byId.set(id, {
+          document: page.documents[i] ?? null,
+          metadata: normalizeMetadata(page.metadatas[i]),
+        });
+      });
+
+      // Chroma does not promise id order, so re-apply the ranking.
+      return ranked.map((r) => ({
+        id: r.id,
+        document: byId.get(r.id)?.document ?? null,
+        metadata: byId.get(r.id)?.metadata ?? r.metadata,
+      }));
     });
   }
 

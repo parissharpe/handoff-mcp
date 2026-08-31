@@ -51,6 +51,15 @@ from typing import Iterator, Optional
 TARGET_CHARS = 1800
 HARD_CHARS = 2400
 
+#: Trailing context copied onto the front of the next chunk so an answer that
+#: straddles a boundary is reachable from either side.
+OVERLAP_CHARS = 250
+
+#: Sentence terminator followed by whitespace. Used to split an oversized turn
+#: at meaning rather than at a character count.
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+_PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
+
 # Roles whose text we treat as conversation.
 KEEP_ROLES = {"user", "assistant"}
 
@@ -193,14 +202,67 @@ def iter_turns(path: Path, stats: ParseStats) -> Iterator[tuple[str, str, Option
             yield role, text, (str(ts) if ts else None)
 
 
+def _split_units(text: str) -> list[str]:
+    """Break a long turn into paragraph- then sentence-sized units.
+
+    Never cuts mid-sentence unless a single sentence is itself longer than the
+    hard cap (a pasted code block or log dump), in which case the remainder is
+    taken on a newline where possible.
+    """
+    units: list[str] = []
+    for para in _PARAGRAPH_BREAK.split(text):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= HARD_CHARS:
+            units.append(para)
+            continue
+        for sentence in _SENTENCE_END.split(para):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            while len(sentence) > HARD_CHARS:
+                cut = sentence.rfind("\n", 0, HARD_CHARS)
+                if cut <= 0:
+                    cut = HARD_CHARS
+                units.append(sentence[:cut].strip())
+                sentence = sentence[cut:].strip()
+            if sentence:
+                units.append(sentence)
+    return units
+
+
+def _tail_overlap(text: str, budget: int = OVERLAP_CHARS) -> str:
+    """Last sentence or two of `text`, for prefixing the next chunk."""
+    if not text or budget <= 0:
+        return ""
+    tail = text[-budget * 2:]
+    sentences = [s for s in _SENTENCE_END.split(tail) if s.strip()]
+    out: list[str] = []
+    total = 0
+    for sentence in reversed(sentences):
+        s = sentence.strip()
+        if total + len(s) > budget and out:
+            break
+        out.insert(0, s)
+        total += len(s) + 1
+    return " ".join(out).strip()
+
+
 def parse_transcript(
     path, *, target_chars: int = TARGET_CHARS, hard_chars: int = HARD_CHARS
 ) -> tuple[list[Chunk], ParseStats]:
     """Parse a transcript into embeddable chunks plus diagnostics.
 
-    Consecutive turns are packed into windows of about `target_chars`; a single
-    turn longer than `hard_chars` is split across windows so no chunk ever
-    exceeds the embedder's usable context by much.
+    Boundaries follow meaning, not character counts:
+
+      * A chunk never spans from the middle of one turn into the middle of
+        another — turns are the atomic unit, and a chunk closes before a turn
+        that would not fit.
+      * A turn too large for one chunk is split on paragraph, then sentence
+        boundaries.
+      * Adjacent chunks share a sentence or two of overlap, so an answer that
+        straddles a boundary is reachable from either side.
     """
     p = Path(path)
     stats = ParseStats(path=str(p))
@@ -210,39 +272,58 @@ def parse_transcript(
     buf_len = 0
     buf_ts: Optional[str] = None
     buf_roles: list[str] = []
+    carry = ""  # overlap text prepended to the next chunk
 
     def flush() -> None:
-        nonlocal buf, buf_len, buf_ts, buf_roles
+        """Emit the buffer as a chunk and remember its tail for the next one."""
+        nonlocal buf, buf_len, buf_ts, buf_roles, carry
         if not buf:
             return
+        body = "\n\n".join(buf).strip()
+        text = f"...{carry}\n\n{body}" if carry else body
         chunks.append(
             Chunk(
                 index=len(chunks),
-                text="\n\n".join(buf).strip(),
+                text=text,
                 first_timestamp=buf_ts,
                 roles=",".join(dict.fromkeys(buf_roles)),
             )
         )
+        carry = _tail_overlap(body)
         buf, buf_len, buf_ts, buf_roles = [], 0, None, []
+
+    def room() -> int:
+        """Chars still available in the current chunk, allowing for overlap."""
+        return target_chars - buf_len - (len(carry) + 5 if not buf and carry else 0)
 
     for role, text, ts in iter_turns(p, stats):
         piece = f"{role}: {text}"
 
-        # A single oversized turn is split rather than dropped.
-        while len(piece) > hard_chars:
-            flush()
-            head, piece = piece[:hard_chars], piece[hard_chars:]
-            chunks.append(
-                Chunk(index=len(chunks), text=head.strip(), first_timestamp=ts, roles=role)
-            )
+        if len(piece) <= hard_chars:
+            # Whole turn, kept intact. Close the chunk first if it won't fit.
+            if buf and len(piece) > room():
+                flush()
+            if buf_ts is None:
+                buf_ts = ts
+            buf.append(piece)
+            buf_roles.append(role)
+            buf_len += len(piece) + 2
+            continue
 
-        if buf and buf_len + len(piece) > target_chars:
-            flush()
-        if buf_ts is None:
-            buf_ts = ts
-        buf.append(piece)
-        buf_roles.append(role)
-        buf_len += len(piece) + 2
+        # Oversized turn: split it on meaning, packing units into chunks.
+        flush()
+        prefix = f"{role}: "
+        for unit in _split_units(text):
+            unit_text = prefix + unit if not buf else unit
+            if buf and len(unit_text) > room():
+                flush()
+                unit_text = unit
+            if buf_ts is None:
+                buf_ts = ts
+            buf.append(unit_text)
+            buf_roles.append(role)
+            buf_len += len(unit_text) + 2
+        flush()
 
     flush()
     stats.chunks = len(chunks)

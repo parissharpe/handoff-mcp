@@ -18,9 +18,10 @@
     "test:cwd": "node scripts/test-cwd.mjs",
     "test:owner-exit": "node scripts/test-owner-exit.mjs",
     "test:env-empty": "node scripts/test-env-empty.mjs",
+    "test:recency": "node scripts/test-recency.mjs",
     "smoke": "node scripts/smoke.mjs",
     "test:integration": "node scripts/integration.mjs",
-    "test": "node scripts/test-store.mjs && node scripts/test-restart.mjs && node scripts/test-cwd.mjs && node scripts/test-owner-exit.mjs && node scripts/test-env-empty.mjs && node scripts/smoke.mjs && node scripts/integration.mjs",
+    "test": "node scripts/test-store.mjs && node scripts/test-restart.mjs && node scripts/test-cwd.mjs && node scripts/test-owner-exit.mjs && node scripts/test-env-empty.mjs && node scripts/test-recency.mjs && node scripts/smoke.mjs && node scripts/integration.mjs",
     "demo": "node demo/seed.mjs"
   },
   "engines": {

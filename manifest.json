@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "handoff",
   "display_name": "Handoff",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Cross-product handoff context: recent cowork activity, recent code activity, and persistent strategist memory backed by Chroma.",
   "author": {
     "name": "Paris Sharpe",

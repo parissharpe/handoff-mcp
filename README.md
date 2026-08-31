@@ -149,7 +149,7 @@ Point `CHROMA_HOST` / `CHROMA_PORT` at it if you use a non-default endpoint.
 
 ## Status
 
-**v0.4.0** — current release (see [CHANGELOG.md](CHANGELOG.md)):
+**v0.5.0** — current release (see [CHANGELOG.md](CHANGELOG.md)):
 
 - ✅ MCP server with all five tools wired to a real ChromaDB store
 - ✅ Local vector store with `cowork_sessions`, `code_sessions`, and `strategist_memory` collections
@@ -158,8 +158,12 @@ Point `CHROMA_HOST` / `CHROMA_PORT` at it if you use a non-default endpoint.
 - ✅ Local embeddings, no API key required
 - ✅ Starts correctly from any working directory (Windows x64 binding resolution fixed in v0.4.0)
 - ✅ Attached clients recover when the shared-server owner exits
+- ✅ Code watcher indexes Claude Code session transcripts from `~/.claude/projects`, chunked per turn (v0.5.0)
+- ✅ Documents tagged with the project they came from, read from each transcript's `cwd` (v0.5.0)
+- ✅ Recency ordered by when the conversation happened, and project filtering pushed into Chroma (v0.5.0)
+- ✅ Hybrid keyword + vector retrieval so exact identifiers are findable (v0.5.0)
 
-**Ideas for later (build only if the community asks):** Obsidian export, multi-project support, custom embedding-model selection, a web UI for browsing the local store.
+**Ideas for later (build only if the community asks):** Obsidian export, custom embedding-model selection, a web UI for browsing the local store.
 
 ---
 
